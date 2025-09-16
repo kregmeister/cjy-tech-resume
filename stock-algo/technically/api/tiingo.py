@@ -15,8 +15,13 @@ import os
 import pandas as pd
 import traceback
 
-from technically.utils.time import LimitAPICalls
-from technically.utils.log import get_logger
+from technically.const import TC_PATH
+from technically.utils.time_limiter import LimitAPICalls
+from technically.utils.log import get_logger, timer
+from technically.utils.optimizations import reformat_names
+from technically.utils.handlers.auth import get_credentials
+
+TIINGO_API_KEY = get_credentials(["tiingo_api_key"])
 
 
 class TiingoAPI:
@@ -24,9 +29,7 @@ class TiingoAPI:
     Initializes requests.session object for Tiingo API calls.
     """
 
-    def __init__(self, base_path: str, api_key):
-        self.base_path = base_path
-        self.api_key = api_key
+    def __init__(self):
         self.session = None
         self.headers = None
 
@@ -38,7 +41,7 @@ class TiingoAPI:
         self.session = session()
         self.headers = {
             'Content-Type': 'application/json',
-            'Authorization': f'Token {self.api_key}'
+            'Authorization': f'Token {TIINGO_API_KEY}'
         }
         self._configure_session()
         return self
@@ -46,12 +49,11 @@ class TiingoAPI:
     def __exit__(self, exc_type, exc_value, exc_traceback):
         self.session.close()
         if exc_type is not None:
-            error_code = "".join(
-                traceback.format_exception(
-                    exc_type, exc_value, exc_traceback
-                )
+            get_logger().error(
+                "Exception in class TiingoAPI context.", extra={
+                    "error": traceback.format_exc()
+                }
             )
-            get_logger().error(error_code)
             return True
 
     def _configure_session(self):
@@ -75,15 +77,19 @@ class TiingoAPI:
         )
         self.session.mount('https://', adapter)
 
-    def make_request(self, url: str, date_columns: list = [], rounded=True):
+    @timer(custom_fields={"url": 2})
+    def make_request(self, ticker: str, url: str, date_columns: list = [], rounded: bool = True, cols_to_format: list = []):
         """
         Makes a request to the Tiingo API.
 
         Args:
+            ticker (str): item_id for log submission(s).
             url (str): The API endpoint to get data from.
             date_columns (list, optional): The fields from the API endpoint that return date strings.
                 They will be converted into ISO 8601 dates. Defaults to [].
             rounded (bool, optional): Whether to round API response or not. Defaults to True.
+            cols_to_format (list, optional): The columns to to re-format elementwise.
+                Passed columns must only contain strings. Defaults to [].
 
         Returns:
             pd.DataFrame: The API response.
@@ -92,20 +98,44 @@ class TiingoAPI:
             call = self.session.get(
                 url, headers=self.headers, timeout=self.timeout
             ).json()
-        except Exception as e:
-            get_logger().error(f"Error making request to {url}: {str(e)}")
+        except Exception:
+            get_logger().error(
+                f"Error making request to Tiingo API.", extra={
+                    "url": url,
+                    "error": traceback.format_exc()
+                }
+            )
             return
 
         self.call_limiter.increment()
-        if call == []:
+        if not call:
             return
 
         try:
-            df = pd.DataFrame.from_dict(call, orient='columns')
-        except Exception as e:
-            get_logger().warning(f"Request returned unexpected output. {str(e)}")
+            df = pd.DataFrame.from_dict(call)
+        except Exception:
+            if call["detail"] == f"Error: Ticker '{ticker.upper()}' not found":
+                return "ticker_not_found"
+            get_logger().warning(
+                f"Tiingo API response output was unexpected.", extra={
+                    "item_id": ticker,
+                    "url": url,
+                    "response": call,
+                    "error": traceback.format_exc()
+                }
+            )
             return
 
+        # Re-names df columns to proper format (i.e. splitFactor -> split_factor)
+        df = df.rename(columns={
+            col_name: reformat_names(col_name) for col_name in df.columns
+        })
+
+        # Re-names df values to proper format
+        if cols_to_format:
+            df[cols_to_format] = df[cols_to_format].map(reformat_names)
+
+        # Converts date strings to date type
         for column in date_columns:
             df[column] = pd.to_datetime(
                 df[column], format='ISO8601'
@@ -125,7 +155,15 @@ class TiingoAPI:
         """
         url = ("https://api.tiingo.com/tiingo/daily/meta"
                "?columns=ticker,permaTicker,name,exchange,assetType,isActive,startDate,endDate")
-        df = self.make_request(url, rounded=False)
+        df = self.make_request(
+            "metadata",
+            url,
+            rounded=False,
+            cols_to_format=[
+                "permaticker",
+                "ticker"
+            ]
+        )
 
         return df
 
@@ -138,49 +176,40 @@ class TiingoAPI:
         """
         profile_url = "https://api.tiingo.com/tiingo/fundamentals/meta"
 
-        profile_df = self.make_request(profile_url, ["statementLastUpdated", "dailyLastUpdated"], rounded=False)
+        profile_df = self.make_request(
+            "metadata",
+            profile_url,
+            ["statement_last_updated", "daily_last_updated"],
+            rounded=False,
+            cols_to_format=[
+                "permaticker",
+                "ticker",
+                "sector",
+                "industry",
+                "sic_sector",
+                "sic_industry"
+            ]
+        )
 
         return profile_df[
-            ["permaTicker",
+            ["permaticker",
              "ticker",
              "sector",
              "industry",
-             "sicSector",
-             "sicIndustry",
-             "companyWebsite",
-             "statementLastUpdated",
-             "dailyLastUpdated"]
+             "sic_sector",
+             "sic_industry",
+             "company_website",
+             "statement_last_updated",
+             "daily_last_updated"]
         ]
 
-    def daily_supported_tickers(self):
-        """
-        Retrieves updated list of supported tickers from API and saves it to CSV.
-
-        Returns:
-            None
-        """
-        tickers = requests.get(
-            "https://apimedia.tiingo.com/docs/tiingo/daily/supported_tickers.zip"
-        )
-
-        zip_path = self.base_path + "/files/supported_tickers.zip"
-
-        with open(zip_path, 'wb') as zf:
-            zf.write(tickers.content)
-
-        with ZipFile(zip_path) as zf:
-            save_dir = self.base_path + "/files"
-            zf.extractall(save_dir)
-
-        os.remove(zip_path)
-
-    def daily_prices(self, ticker: str, assetType: str, start_date: str):
+    def daily_prices(self, ticker: str, asset_type: str, start_date: str):
         """
         Retrieves price data from API.
 
         Args:
             ticker (str): Security to get data for.
-            assetType (str): 'stock' or 'etf'.
+            asset_type (str): 'stock' or 'etf'.
             start_date (str): The earliest date to get data for.
 
         Returns:
@@ -199,21 +228,25 @@ class TiingoAPI:
         )
 
         # Obtains API price endpoint as DataFrame
-        price_df = self.make_request(price_url, ["date"])
+        price_df = self.make_request(ticker, price_url, ["date"])
 
-        if price_df is None:
-            return
+        if not isinstance(price_df, pd.DataFrame):
+            return price_df
 
-        if assetType == "stock":
-            fund_df = self.make_request(fund_url, ["date"])
+        if asset_type == "stock":
+            fund_df = self.make_request(ticker, fund_url, ["date"])
             if fund_df is None:
                 return price_df
 
             try:
                 merged_df = price_df.merge(fund_df, how="left", on="date")
-            except Exception as e:
-                get_logger().error((f"Daily prices and daily fundamentals could not be merged for ",
-                                    f"{ticker}: {str(e)}"))
+            except Exception:
+                get_logger().error(
+                    f"Daily prices and daily fundamentals DataFrames could not be merged.", extras={
+                        "item_id": ticker,
+                        "error": traceback.format_exc()
+                    }
+                )
                 return price_df
 
             # Converts all columns except date to float type
@@ -239,21 +272,24 @@ class TiingoAPI:
                     Dict keys are statement names, values are statement data.
 
         Example:
-            >>> stmt_dfs_dict = {"balanceSheet": pd.DataFrame, "cashFlow": pd.DataFrame}
+            stmt_dfs_dict = {"balanceSheet": pd.DataFrame, "cashFlow": pd.DataFrame}
 
         """
         statement_url = (
             "https://api.tiingo.com/tiingo/fundamentals/"
             f"{ticker}/statements?asReported=true&startDate={start_date}"
         )
-        stmts_df = self.make_request(statement_url, ["date"])
+        stmts_df = self.make_request(ticker, statement_url, ["date"])
 
-        if stmts_df is None:
+        if not isinstance(stmts_df, pd.DataFrame):
             return
 
-        stmts_df = stmts_df[["date", "statementData"]][stmts_df["quarter"] != 0]
+        stmts_df = stmts_df[["date", "statement_data"]][stmts_df["quarter"] != 0]
 
+        # API call returns statement types (keys) in camel case
         stmt_dfs_dict = {"balanceSheet": [], "incomeStatement": [], "cashFlow": []}
+
+        # Parses dict from API and converts pandas dataframe for each statement type
         for stmt_date, stmts in stmts_df.values.tolist():
             for stmt_type in stmt_dfs_dict.keys():
                 try:
@@ -277,12 +313,18 @@ class TiingoAPI:
 
                 stmt_dfs_dict[stmt_type].append(statement_df)
         try:
+            # Converts statement types (keys) from camel to snake case and concatenates values into dataframe
             stmt_dfs_dict = {
-                key: pd.concat(value, ignore_index=True)
+                reformat_names(key): pd.concat(value, ignore_index=True)
                 for key, value in stmt_dfs_dict.items()
             }
         except ValueError:
-            get_logger().warning(f"No fundamentals found for {ticker}.")
+            get_logger().warning(
+                "No fundamentals data returned.", extra={
+                    "item_id": ticker,
+                    "error": traceback.format_exc()
+                }
+            )
             return
 
         return stmt_dfs_dict

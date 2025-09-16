@@ -7,41 +7,27 @@ Created on Mon Sep  9 13:34:44 2024
 """
 
 import os
-import duckdb
+from technically.const import TC_PATH
 
-class TechnicallyInitialization:
+
+def directories_setup():
     """
-    Initializes the main directory structure and database connections.
+    Initializes the main directory structure.
+    It may, in the future, create and configure a PostgreSQL database.
+
+    Returns:
+        None
     """
+    os.mkdir(TC_PATH)
+    # Creates main data subdirectories
+    for subdir in ["parquet", "logs"]:
+        os.mkdir(TC_PATH + f"/{subdir}")
 
-    def __init__(self, base_path):
-        self.base_path = base_path
+    # Creates subdirectories for parquet
+    for subdir in ["daily", "quarterly"]:
+        os.mkdir(TC_PATH + f"/parquet/{subdir}")
 
-    def execute(self):
-        self.directories_setup()
-        self.duckdb_setup()
+    # Creates subdirectories for logs
+    for subdir in ["main", "dev", "resources"]:
+        os.mkdir(TC_PATH + f"/logs/{subdir}")
 
-    def directories_setup(self):
-        os.mkdir(self.base_path)
-        # Creates main data subdirectories
-        for subdir in ["sql", "parquet", "models", "backtests", "logs", "files"]:
-            os.mkdir(self.base_path + f"/{subdir}")
-            if subdir == "csv":
-                os.mkdir(self.base_path + "/csv/results")
-
-        # Creates subdirectories for parquet
-        for subdir in ["daily", "quarterly"]:
-            os.mkdir(self.base_path + f"/parquet/{subdir}")
-
-        # Creates subdirectories for logs
-        for subdir in ["main", "dev", "backtests", "resources"]:
-            os.mkdir(self.base_path + f"/logs/{subdir}")
-
-
-    def duckdb_setup(self):
-        # Creates empty databases
-        for name in ["prices", "fundamentals", "models"]:
-            db_path = self.base_path + f"/sql/{name}.duck"
-            conn = duckdb.connect(db_path)
-            conn.close()
-        

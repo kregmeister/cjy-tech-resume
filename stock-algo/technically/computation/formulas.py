@@ -3,14 +3,14 @@
 """
 Created on Thu Jan  5 10:58:21 2023
 
-@author: craigyingling321
+@author: cjymain
 """
 
-import re
 import numpy as np
 import pandas as pd
 from filterpy.kalman import KalmanFilter
 import pywt
+from technically.const import TREND_PERIODS, MIN_PERIODS, TREND_STRENGTH_SCORING
 
 from technically.utils import optimizations as utils
 
@@ -20,9 +20,15 @@ class TechnicalFormulas:
     Calculates technical indicators and other features.
     """
 
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, calc_num: int):
         self.df = df.copy()  # Columns added throughout
         self.og_df = df.copy()  # Includes only price data
+        if calc_num > len(df):  # Calculates all periods
+            self.calc_num = len(df)
+            self.full = True
+        else:  # Calculates increment of periods
+            self.calc_num = calc_num + MIN_PERIODS
+            self.full = False
 
     def persist(self):
         """
@@ -33,57 +39,51 @@ class TechnicalFormulas:
         """
         return self.df
 
-    def price_ceilings_floors(self, percentiles: tuple = (99, 1)):
+    def apply(self, column: str, ser: pd.Series | np.ndarray, calc_num: int = None):
         """
-        Creates price ceilings and floors based on percentiles of daily price changes for each period.
-        Generates self.df columns: priceCeiling, priceFloor, priceChange.
+        Applies the technical formula results to self.df.
 
         Args:
-            percentiles (tuple): Top and bottom percentiles for price ceiling and floor.
-                Default is (99, 1).
+            column (str): new df column name.
+            ser (pd.Series | np.ndarray): series to apply the technical formula to.
+            calc_num (int): how many rows to be applied to self.df.
+            Defaults to self.calc_num, but may need to be passed manually.
 
         Returns:
             None
         """
-        # Separates self.df into multiple DataFrames by date
-        buckets = utils.bucketizer(self.og_df[["date", "close"]].copy())
+        if self.full:
+            self.df[column] = ser
+        else:
+            if calc_num is None:
+                calc_num = self.calc_num
+            if isinstance(ser, np.ndarray | list):
+                ser = pd.Series(ser, index=self.df.index[-calc_num:])
+            else:
+                ser.index = self.df.index[-calc_num:]
 
-        ceilings = []
-        floors = []
-        diffs = []
-        for df in buckets:
-            # Calculates daily change in price and percentiles of those changes
-            price_changes = df["close"].diff()
-            ceiling = utils.percentile(price_changes, percentiles[0])
-            floor = utils.percentile(price_changes, percentiles[1])
-
-            # Applies current ceilings and floors to detect extreme price changes
-            diffs.append(price_changes)
-            ceilings.append(df["close"].shift(1) + ceiling)
-            floors.append(df["close"].shift(1) + floor)
-
-        self.df["priceChange"] = np.concatenate(diffs)
-        self.df["priceCeiling"] = np.concatenate(ceilings)
-        self.df["priceFloor"] = np.concatenate(floors)
+            self.df[column] = pd.Series([np.nan] * len(self.df), index=self.df.index)
+            self.df.loc[calc_num:, column] = ser
         return
 
-    def demand_index(self, period=10, priceRange=2, smoothing=10):
+    # Incremental calculations (requires partial data)
+    def demand_index(self, period=10, price_range=2, smoothing=10):
         """
         Recursively calculates demand index for each period.
         Generates self.df columns: demandIndex
 
         Args:
             period (int): Number of days for rolling mean of price range. Default is 10.
-            priceRange (int): Number of days for price range calculation. Default is 2.
+            price_range (int): Number of days for price range calculation. Default is 2.
             smoothing (int): Number of days for smoothing. Default is 10.
 
         Returns:
             None
         """
-        df = self.og_df[["open", "high", "low", "close", "volume"]].copy()
+        df = self.og_df[["open", "high", "low", "close", "volume"]].iloc[-self.calc_num:].copy()
         P = (df["close"] - df["open"]) / df["open"]
 
-        two_day_price_range = df["high"].rolling(window=priceRange).max() - df["low"].rolling(window=priceRange).min()
+        two_day_price_range = df["high"].rolling(window=price_range).max() - df["low"].rolling(window=price_range).min()
         VA = two_day_price_range.rolling(window=period).mean()
         K = (3 * df["close"]) / VA
 
@@ -98,32 +98,38 @@ class TechnicalFormulas:
         pressure_mask = abs(BP) > abs(SP)
         DI = np.where(pressure_mask, SP / BP, BP / SP)
         DI_smoothed = pd.Series(DI).ewm(span=smoothing).mean()
-        self.df["demandIndex"] = DI_smoothed
+
+        self.apply("demand_idx", DI_smoothed)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.demand_idx_period = period
+        #self.df.demand_idx_window = price_range
+        #self.df.demand_idx_smoothing = smoothing
         return
 
-    def kalman_filter_multi(self, N=1, processNoise=0.01, measurementNoise=15.0, initialErrorCovariance=100.0):
+    def kalman_filter_multi(self, n_states=1, process_noise=0.01, measurement_noise=15.0, initial_error_covariance=100.0):
         """
         Kalman filter with multiple state vectors.
-        Generates self.df columns: kalmanClose, kalmanTrend
+        Generates self.df columns: kalman_close, kalman_trend
 
         Args:
         N (int): Number of states. Default is 1.
-        processNoise (float): Noise to add to each state vector. Default is 0.01.
-        measurementNoise (float): Noise to add to each resulting value. Default is 15.0.
-        initialErrorCovariance (float): Initial error covariance. Default is 100.0.
+        process_noise (float): Noise to add to each state vector. Default is 0.01.
+        measurement_noise (float): Noise to add to each resulting value. Default is 15.0.
+        initial_error_covariance (float): Initial error covariance. Default is 100.0.
 
         Returns:
             None
         """
-        values = self.og_df["close"].copy().values
+        values = self.og_df["close"].iloc[-self.calc_num:].copy().values
 
-        kf = KalmanFilter(dim_x=N, dim_z=1)
+        kf = KalmanFilter(dim_x=n_states, dim_z=1)
 
-        kf.F = np.eye(N)  # State transition matrix
-        kf.H = np.ones((1, N))  # Measurement matrix
-        kf.P *= initialErrorCovariance
-        kf.R = measurementNoise
-        kf.Q = processNoise
+        kf.F = np.eye(n_states)  # State transition matrix
+        kf.H = np.ones((1, n_states))  # Measurement matrix
+        kf.P *= initial_error_covariance
+        kf.R = measurement_noise
+        kf.Q = process_noise
 
         # Starting with the first price and zero velocity
         kf.x = np.array([[values[0]]])
@@ -165,39 +171,46 @@ class TechnicalFormulas:
             # Update previous filtered price
             prev_filtered_value = filtered_value
 
-        self.df["kalmanClose"] = filtered_values
-        self.df["kalmanTrend"] = trends
+        self.apply("kalman_close", filtered_values)
+        self.apply("kalman_trend", trends)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.kalman_close_states = n_states
+        #self.df.kalman_close_process_noise = process_noise
+        #self.df.kalman_close_measurement_noise = measurement_noise
+        #self.df.kalman_close_initial_error_covariance = initial_error_covariance
         return
 
-    def kalman_filter_single(self, Q=0.01, R=15.0, P0=100.0, trending=True):
+    def kalman_filter_single(self, process_noise=0.01, measurement_noise=15.0, initial_error_covariance=100.0, trending=True):
         """
         Kalman filter with a single state vector.
-        Generates self.df columns: kalmanClose, kalmanTrend.
+        Generates self.df columns: kalman_close, kalman_trend.
 
         Args:
-            Q (float): Covariance of process noise. Default is 0.01.
-            R (float): Covariance of measurement noise. Default is 15.0.
-            P0 (float): Initial error covariance. Default is 100.0.
+            process_noise (float): Covariance of process noise. Default is 0.01.
+            measurement_noise (float): Covariance of measurement noise. Default is 15.0.
+            initial_error_covariance (float): Initial error covariance. Default is 100.0.
             trending (bool): Whether to track trend direction and length based on kalman filter outputs. Default is True.
 
         Returns:
             None
         """
-        values = self.og_df["close"].copy().values
+        calc_num = self.calc_num + 200
+        values = self.og_df["close"].iloc[-calc_num:].copy().values
 
         filtered_values = []
         trends = []
 
         prev_x = None
         x = values[0]
-        P = P0
+        P = initial_error_covariance
         trend = 0
         for z in values:
             # Predict step
             x_pred = x
-            P_pred = P + Q
+            P_pred = P + process_noise
             # Kalman Gain
-            K = P_pred / (P_pred + R)
+            K = P_pred / (P_pred + measurement_noise)
             # Update step
             x = x_pred + K * (z - x_pred)
             P = (1 - K) * P_pred
@@ -224,8 +237,13 @@ class TechnicalFormulas:
             # Update previous filtered price
             prev_x = x
 
-        self.df["kalmanClose"] = filtered_values
-        self.df["kalmanTrend"] = trends
+        self.apply("kalman_close", filtered_values, calc_num=calc_num)
+        self.apply("kalman_trend", trends, calc_num=calc_num)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.kalman_close_process_noise = process_noise
+        #self.df.kalman_close_measurement_noise = measurement_noise
+        #self.df.kalman_close_initial_error_covariance = initial_error_covariance
         return
 
     def wavelets(self, wavelet="db6", scale=0.3):
@@ -240,7 +258,7 @@ class TechnicalFormulas:
         Returns:
             None
         """
-        values = self.og_df["close"].copy().values
+        values = self.og_df["close"].iloc[-self.calc_num:].copy().values
 
         # Deconstruct price coefficients
         coefficients = pywt.wavedec(values, wavelet, mode='per')
@@ -252,27 +270,29 @@ class TechnicalFormulas:
         # Reconstruct de-noised values
         reconstructed_signal = pywt.waverec(coefficients, wavelet, mode='per')
 
-        self.df[f"wavelet_{wavelet}"] = reconstructed_signal
+        self.apply(f"wavelet_{wavelet}", reconstructed_signal)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.wavelet_scale = scale
         return
 
-    def percent_from_extreme(self, period=250, min_len=120, type="max"):
+    def percent_from_extreme(self, period=250, direction="max"):
         """
         Measures the percent difference between a given rolling window's max/min and closing price.
         Generates self.df columns: percentDiffMax or percentDiffMin
 
         Args:
             period (int): Size of the rolling window. Default is 250.
-            min_len (int): Minimum length of the DataFrame. Default is 120.
-            type (str): Options are "max" or "min". Default is "max".
+            direction (str): Options are "max" or "min". Default is "max".
 
         Returns:
             None
         """
-        df = self.og_df[["high", "low", "close"]].copy()
+        df = self.og_df[["high", "low", "close"]].iloc[-self.calc_num:].copy()
 
         # Sets period to min_len if DataFrame length falls between them
-        if min_len <= len(df) <= period:
-            period = min_len
+        if MIN_PERIODS <= len(df) <= period:
+            period = MIN_PERIODS
 
         # Percent difference formula
         def _pc_diff(close, extreme):
@@ -280,27 +300,37 @@ class TechnicalFormulas:
             return pc
 
         # Calculates
-        if type == "max":
+        if direction == "max":
             year_high = df["high"].rolling(window=period).max()
-            self.df["percentDiffMax"] =  _pc_diff(df["close"], year_high)
+            pc_diff = _pc_diff(df["close"], year_high)
+            self.apply("close_percent_from_max", pc_diff)
+
+            # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+            #self.df.close_percent_from_max_period = period
+            #self.df.close_percent_from_max_min_len = min_len
         else:
             year_low = df["low"].rolling(window=period).min()
-            self.df["percentDiffMin"] = _pc_diff(df["close"], year_low)
+            pc_diff = _pc_diff(df["close"], year_low)
+            self.apply("close_percent_from_min", pc_diff)
+
+            # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+            #self.df.close_percent_from_min_period = period
+            #self.df.close_percent_from_min_min_len = min_len
         return
 
-    def average_true_range(self, period=20, min_periods=120):
+    def average_true_range(self, period=20):
         """
         Calculates the Average True Range (ATR) of a given time period.
-        Generates self.df columns: atr20
+        Generates self.df columns: atr
 
         Args:
             period (int): EMA length of True Range (TR). Default is 20.
-            min_periods (int): Minimum length of the DataFrame. Default is 120.
 
         Returns:
             None
         """
-        df = self.og_df[["high", "low", "close"]].copy()
+        calc_num = self.calc_num + 100
+        df = self.og_df[["high", "low", "close"]].iloc[-calc_num:].copy()
 
         alpha = 1/period
 
@@ -311,9 +341,13 @@ class TechnicalFormulas:
         tr = pd.concat([h_l, h_c, l_c], axis=1).max(axis=1)
 
         # ATR
-        atr = tr.ewm(alpha=alpha, adjust=False, min_periods=min_periods).mean()
+        atr = tr.ewm(alpha=alpha, adjust=False, min_periods=MIN_PERIODS).mean()
 
-        self.df[f"atr{period}"] = atr
+        self.apply("atr", atr, calc_num=calc_num)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.atr_period = period
+        #self.df.atr_period_min_len = min_periods
         return
 
     def aroon_oscillator(self, period=20):
@@ -327,7 +361,7 @@ class TechnicalFormulas:
         Returns:
             None
         """
-        df = self.og_df[["high", "low"]].copy()
+        df = self.og_df[["high", "low"]].iloc[-self.calc_num:].copy()
 
         # Counts how many periods since the window's max/min
         periods_since_high = df['high'].rolling(window=period).apply(
@@ -343,7 +377,10 @@ class TechnicalFormulas:
 
         aroon = aroon_up - aroon_down
 
-        self.df[f"aroon{period}"] = aroon
+        self.apply("aroon", aroon)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.aroon_period = period
         return
 
     def commodity_channel_index(self, period=20, smoothing=14):
@@ -358,7 +395,7 @@ class TechnicalFormulas:
         Returns:
             None
         """
-        df = self.og_df[["high", "low", "close"]].copy()
+        df = self.og_df[["high", "low", "close"]].iloc[-self.calc_num:].copy()
 
         # Typical price
         tp = (df['high'] + df['low'] + df['close']) / 3
@@ -371,10 +408,14 @@ class TechnicalFormulas:
 
         # Calculates CCI and smooths
         cci = (tp - ma) / (.015 * md)
-        ccima = (cci.rolling(window=smoothing).sum()) / smoothing
+        cci_ma = (cci.rolling(window=smoothing).sum()) / smoothing
 
-        self.df[f"cci{period}"] = cci
-        self.df[f"cci{period}_ma{smoothing}"] = ccima
+        self.apply("cci", cci)
+        self.apply("cci_ma", cci_ma)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.cci_period = period
+        #self.df.cci_smoothing = smoothing
         return
 
     def relative_strength_index(self, period=14):
@@ -388,7 +429,7 @@ class TechnicalFormulas:
         Returns:
             None
         """
-        close = self.og_df['close'].copy().values
+        close = self.og_df['close'].iloc[-self.calc_num:].copy().values
 
         diffs = np.diff(close, prepend=np.nan)
 
@@ -418,7 +459,10 @@ class TechnicalFormulas:
             # Calculate RSI for period
             rsi[i] = 100 - (100 / (1 + rs))
 
-        self.df[f"rsi{period}"] = rsi
+        self.apply("rsi", rsi)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.rsi_period = period
         return
 
     def stdev_percent_of_sma(self, period=20):
@@ -432,20 +476,23 @@ class TechnicalFormulas:
         Returns:
             None
         """
-        series = self.og_df["close"].copy()
+        series = self.og_df["close"].iloc[-self.calc_num:].copy()
 
         sma = series.rolling(window=period).mean()
         std = series.rolling(window=period).std()
 
         pc_std = (std / sma) * 100
 
-        self.df[f"STDevPercent{period}"] = pc_std
+        self.apply("stdev_percent_of_sma", pc_std)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.stdev_percent_of_sma_period = period
         return
 
     def bollinger_bands(self, period=20):
         """
         Calculates the Bollinger Bands of a given time period.
-        Generates self.df columns: BollingerUpper20, BollingerSMA20, BollingerLower20, BollingerRange20
+        Generates self.df columns: BollingerUpper20, BollingerSMA20, BollingerLower20, bollinger_band_range
 
         Args:
             period (int): Length of the moving average and standard deviation window. Default is 20.
@@ -453,7 +500,7 @@ class TechnicalFormulas:
         Returns:
             None
         """
-        series = self.og_df["close"].copy()
+        series = self.og_df["close"].iloc[-self.calc_num:].copy()
 
         sma = series.rolling(window=period).mean()
         std = series.rolling(window=period).std()
@@ -461,10 +508,14 @@ class TechnicalFormulas:
         upper_band = (sma + (std * 2))
         lower_band = (sma - (std * 2))
 
-        self.df[f"bollingerUpper{period}"] = upper_band
-        self.df[f"bollingerSMA{period}"] = sma
-        self.df[f"bollingerLower{period}"] = lower_band
-        self.df[f"bollingerRange{period}"] = upper_band - lower_band
+        self.apply("bollinger_upper_band", upper_band)
+        self.apply("bollinger_sma", sma)
+        self.apply("bollinger_lower_band", lower_band)
+        self.apply("bollinger_band_range", upper_band - lower_band)
+
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.bollinger_sma_period = period
         return
 
     def short_know_sure_thing(self, roc1=10, roc2=15, roc3=20, roc4=30, sma1=10, sma2=10, sma3=10, sma4=15, sig=9):
@@ -486,7 +537,7 @@ class TechnicalFormulas:
         Returns:
             None
         """
-        series = self.og_df["close"].copy()
+        series = self.og_df["close"].iloc[-self.calc_num:].copy()
 
         # Calculates rate of change for each period
         shift_1 = series.shift(roc1)
@@ -511,14 +562,25 @@ class TechnicalFormulas:
         kst = (rcma1 * 1) + (rcma2 * 2) + (rcma3 * 3) + (rcma4 * 4)
         signal = kst.rolling(window=sig).mean()
 
-        self.df["kst"] = kst
-        self.df["kstSig"] = signal
+        self.apply("kst", kst)
+        self.apply("kst_sig", signal)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.kst_roc1 = roc1
+        #self.df.kst_roc2 = roc2
+        #self.df.kst_roc3 = roc3
+        #self.df.kst_roc4 = roc4
+        #self.df.kst_sma1 = sma1
+        #self.df.kst_sma2 = sma2
+        #self.df.kst_sma3 = sma3
+        #self.df.kst_sma4 = sma4
+        #self.df.kst_sig = sig
         return
 
-    def moving_average_convergence_divergence(self, ema_short=12, ema_long=26, min_periods=100):
+    def moving_average_convergence_divergence(self, ema_short=12, ema_long=26):
         """
         Calculates the Moving Average Convergence Divergence (MACD).
-        Generates self.df columns: macd, macdSig, macdHist
+        Generates self.df columns: macd, macdSig, macd_hist
 
         Args:
         ema_short (int): Period of EMA short moving average. Default is 12.
@@ -528,17 +590,23 @@ class TechnicalFormulas:
         Returns:
             None
         """
-        series = self.og_df["close"].copy()
+        calc_num = self.calc_num + 50
+        series = self.og_df["close"].iloc[-calc_num:].copy()
 
-        twelve = series.ewm(span=ema_short, min_periods=min_periods).mean()
-        twenty_six = series.ewm(span=ema_long, min_periods=min_periods).mean()
+        twelve = series.ewm(span=ema_short, min_periods=MIN_PERIODS).mean()
+        twenty_six = series.ewm(span=ema_long, min_periods=MIN_PERIODS).mean()
 
         macd = twelve - twenty_six
         signal = macd.ewm(span=9).mean()
 
-        self.df["macd"] = macd
-        self.df["macdSig"] = signal
-        self.df["macdHist"] = macd - signal
+        self.apply("macd", macd, calc_num=calc_num)
+        self.apply("macd_sig", signal, calc_num=calc_num)
+        self.apply("macd_hist", macd - signal, calc_num=calc_num)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.macd_ema_short = ema_short
+        #self.df.macd_ema_long = ema_long
+        #self.df.macd_min_len = min_periods
         return
 
     def williams_percent_r(self, period=14):
@@ -552,14 +620,17 @@ class TechnicalFormulas:
         Returns:
             None
         """
-        df = self.og_df[["high", "low", "close"]].copy()
+        df = self.og_df[["high", "low", "close"]].iloc[-self.calc_num:].copy()
 
         maxes = df['high'].rolling(period).max()
         mins = df['low'].rolling(period).min()
 
         wpr = ((maxes - df['close']) / (maxes - mins)) * -100
 
-        self.df[f"williamsR{period}"] = wpr
+        self.apply("wpr", wpr)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.wpr_period = period
         return
 
     def stochastic_oscillator(self, period=20):
@@ -573,7 +644,7 @@ class TechnicalFormulas:
         Returns
             None
         """
-        df = self.og_df[["high", "low", "close"]].copy()
+        df = self.og_df[["high", "low", "close"]].iloc[-self.calc_num:].copy()
 
         mins = df['low'].rolling(period).min()
         maxes = df['high'].rolling(period).max()
@@ -582,8 +653,11 @@ class TechnicalFormulas:
         percent_k = (df['close'] - mins) / (maxes - mins) * 100
         percent_d = percent_k.rolling(3).mean()
 
-        self.df[f"stochasticK{period}"] = percent_k
-        self.df[f"stochasticD{period}"] = percent_d
+        self.apply("stochastic_k", percent_k)
+        self.apply("stochastic_d", percent_d)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.stochastic_k_period = period
         return
 
     def parabolic_sar(self, start=0.02, increment=0.02, maximum=0.2):
@@ -599,7 +673,7 @@ class TechnicalFormulas:
         Returns:
             None
         """
-        df = self.og_df[["high", "low"]].copy()
+        df = self.og_df[["high", "low"]].iloc[-self.calc_num:].copy()
 
         af_init = start
         af_max = maximum
@@ -654,22 +728,27 @@ class TechnicalFormulas:
         sar.insert(0, None)
         sar = pd.Series(sar)
 
-        self.df["psar"] = sar
+        self.apply("psar", sar)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.psar_start = start
+        #self.df.psar_increment = increment
+        #self.df.psar_maximum = maximum
         return
 
-    def average_directional_index(self, smoothing=14, min_periods=100):
+    def average_directional_index(self, smoothing=14):
         """
         Calculates the Average Directional Index (ADX) of a given time period.
-        Generates self.df columns: adx, dmiPlus, dmiMinus
+        Generates self.df columns: adx, dmi_plus, dmi_minus
 
         Args:
             smoothing (int): Denominator of alpha. Default is 14.
-            min_periods (int): Minimum number of periods required to calculate ADX. Default is 100.
 
         Returns:
             None
         """
-        df = self.og_df[["high", "low", "close"]].copy()
+        calc_num = self.calc_num + 100
+        df = self.og_df[["high", "low", "close"]].iloc[-calc_num:].copy()
 
         alpha = 1/smoothing
 
@@ -680,7 +759,8 @@ class TechnicalFormulas:
         tr = pd.concat([h_l, h_c, l_c], axis=1).max(axis=1)
 
         # ATR
-        atr = tr.ewm(alpha=alpha, adjust=False, min_periods=min_periods).mean()
+        atr = tr.ewm(alpha=alpha, adjust=False, min_periods=MIN_PERIODS).mean()
+        atr.reset_index(drop=True, inplace=True)
 
         # DX+-
         h_ph = df['high'] - df['high'].shift(1)
@@ -702,68 +782,84 @@ class TechnicalFormulas:
 
         # DMI+-
         s_plus_dm = plus_dx.ewm(
-            alpha=alpha, adjust=False, min_periods=min_periods
+            alpha=alpha, adjust=False, min_periods=MIN_PERIODS
         ).mean()
         s_minus_dm = minus_dx.ewm(
-            alpha=alpha, adjust=False, min_periods=min_periods
+            alpha=alpha, adjust=False, min_periods=MIN_PERIODS
         ).mean()
-        dmi_plus = (s_plus_dm/atr)*100
-        dmi_minus = (s_minus_dm/atr)*100
+
+        dmi_plus = (s_plus_dm / atr) * 100
+        dmi_minus = (s_minus_dm / atr) * 100
 
         # DX & ADX
-        dx = (np.abs(dmi_plus - dmi_minus)/(dmi_plus + dmi_minus))*100
+        dx = (np.abs(dmi_plus - dmi_minus) / (dmi_plus + dmi_minus)) * 100
         adx = dx.ewm(alpha=alpha, adjust=False).mean()
 
-        self.df["adx"] = adx
-        self.df["dmiPlus"] = dmi_plus
-        self.df["dmiMinus"] = dmi_minus
+        self.apply("adx", adx, calc_num=calc_num)
+        self.apply("dmi_plus", dmi_plus, calc_num=calc_num)
+        self.apply("dmi_minus", dmi_minus, calc_num=calc_num)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.adx_smoothing = smoothing
+        #self.df.adx_min_len = min_periods
         return
 
-    def exponential_moving_average(self, period: int, column="close", min_periods=120):
+    def exponential_moving_average(self, period: int, column="close"):
         """
         Calculates the Exponential Moving Average (EMA) of a given time period.
-        Generates self.df columns: ema10
+        Generates self.df columns: ema_{period}
 
         Args:
             period (int): Number of periods to calculate EMA for.
             column (str): Column to calculate EMA for. Default is 'close'.
-            min_periods (int): Minimum number of periods required to calculate EMA. Default is 120.
 
         Returns:
             None
         """
-        self.df[f"ema{period}"] = self.og_df[column].copy().ewm(span=period, min_periods=min_periods).mean()
+        # Ensures there are enough values to produce a stable EMA
+        calc_num = period + self.calc_num
+        ema = self.og_df[column].iloc[-calc_num:].copy().ewm(span=period, min_periods=MIN_PERIODS).mean()
+        self.apply(f"ema_{period}", ema, calc_num=calc_num)
         return
 
-    def kaufman_adaptive_moving_average(self, data: pd.Series, period: int, min_periods=120, apply=True):
+    # Recursive calculations (requires full data)
+    def kaufman_adaptive_moving_average(self, column: str | pd.Series, period: int, apply=True):
         """
         Calculates Kaufman's Adaptive Moving Average (KAMA) of a given time period with Average True Range (ATR) normalization.
+        NOTE: When passing 'column' as string, the self.calc_num dataframe slicer is applied.
+        When passing 'column' as pd.Series, full dataframe is applied.
         Generates self.df columns: kama20
 
         Args:
-            data (pd.Series): Time series to calculate KAMA for.
+            column (str): Column in self.df OR pd.Series to calculate KAMA for.
             period (int): Number of periods to calculate KAMA for.
-            min_periods: Minimum number of periods required to calculate KAMA. Default is 120.
             apply: Whether to apply the result to self.df or return it as a stand-alone Pandas Series. Default is True.
 
         Returns:
             None
         """
-        atr = self.df["atr20"].copy()
+        if isinstance(column, str):
+            data = self.df[column].copy().values
+            atr = self.df["atr"].copy().values
+        else:
+            data = column.values
+            atr = self.df["atr"].copy().values
 
-        change = np.abs(data.diff(period).to_numpy())
+        # Change calculation
+        change = np.pad(np.abs(data[period:] - data[:-period]), (period, 0), 'constant', constant_values=np.nan)
+
         # Volatility moving average
-        volatility = np.abs(np.diff(data)).astype(float)
-        volatility = pd.Series(volatility).rolling(window=period).sum().to_numpy()
-        volatility = np.insert(volatility, 0, np.nan)
+        vol_diff = np.abs(np.diff(data))
+        volatility = np.pad(np.convolve(vol_diff, np.ones(period), 'valid'), (period, 0), 'constant',
+                            constant_values=np.nan)
 
         # Efficiency ratio
-        er = np.zeros_like(data, dtype=float)
-        mask = volatility > 0
-        er[mask] = change[mask] / volatility[mask]
+        er = np.divide(change, volatility, where=volatility > 0, out=np.zeros_like(data, dtype=float))
 
-        # Uses normalized Average True Range to dynamically scale fast and slow periods
-        atr_normalized = (atr / atr.rolling(window=min_periods).mean()).to_numpy()
+        # Normalized Average True Range
+        atr_mean = np.pad(np.convolve(atr, np.ones(MIN_PERIODS) / MIN_PERIODS, 'valid'), (MIN_PERIODS - 1, 0),
+                          'constant', constant_values=np.nan)
+        atr_normalized = atr / atr_mean
 
         # Ignores Numpy runtime warning
         with np.errstate(invalid="ignore"):
@@ -791,7 +887,12 @@ class TechnicalFormulas:
         adaptive_ma[adaptive_ma == 0.000000] = np.nan
 
         if apply:
-            self.df[f"kama{period}"] = adaptive_ma
+            self.df["kama"] = adaptive_ma
+
+            # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+            #self.df.kama_period = period
+            #self.df.kama_min_len = min_periods
+            return
         else:
             return adaptive_ma
 
@@ -816,18 +917,18 @@ class TechnicalFormulas:
         obv = np.sum(np.lib.stride_tricks.sliding_window_view(obv_changes, period), axis=1)
         obv = np.insert(obv, range(period-1), np.nan)
 
-        self.df["OBV"] = obv
+        self.df["obv"] = obv
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.obv_period = period
         return
 
-    # Advanced calculations
-    def current_trend(self, periods: dict = {"twoWeek": 10, "month": 20, "threeMonth": 60, "sixMonth": 120, "year": 250,
-                                            "threeYear": 750}, y_col: str = "KAMA20"):
+    def current_trend(self, y_col: str = "kama"):
         """
         Determines the current trend by calculating line best fit at different periods, averaging them, and taking percentiles.
-        Generates self.df columns: {key}TrendLine for key in periods dict, prevailingTrendLine.
+        Generates self.df columns: {key}_trend_line for key in periods dict, prevailing_trend_line.
 
         Args:
-            periods (dict): Keys are corresponding column names, values are the number of time periods for the line best fit.
             y_col: Column used to create trend lines. Default is "KAMA20".
 
         Returns:
@@ -837,17 +938,21 @@ class TechnicalFormulas:
         Y = utils.rolling_zscore(Y)
 
         X_dict = {}
-        for name, period in periods.items():
+        for name, period in TREND_PERIODS.items():
             if len(Y) < period + 20:
                 continue
-            slopes = pd.Series(utils.lineBestFit(Y, period))
-            X_dict[f"{name}TrendLine"] = slopes
+            slopes = pd.Series(utils.line_best_fit(Y, period))
+            X_dict[f"{name}_trend_slope"] = slopes
 
         trends_df = pd.DataFrame(X_dict)
-        trends_df["prevailingTrendLine"] = trends_df["twoWeekTrendLine"]
 
-        for column in list(trends_df.columns) + ["prevailingTrendLine"]:
-            X = trends_df[column]
+        for name, period in TREND_PERIODS.items():
+            column = f"{name}_trend_slope"
+
+            try:
+                X = trends_df[column]
+            except KeyError:
+                continue
 
             if len(X) < 20:
                 continue
@@ -867,19 +972,16 @@ class TechnicalFormulas:
             ]
             res = np.select(conditions, [1, -1])
 
-            new_column = "".join(re.findall('[a-zA-Z][^A-Z]*', column)[:-1])
+            new_column = "_".join(column.split("_")[:-1])
             trends_df[new_column] = res
 
         self.df = pd.concat([self.df, trends_df], axis=1)
 
-    def trend_strength_score(self, weights: dict = {"closeDiff": 25, "movingAverageConvergenceDivergence": 30,
-                                                    "dmiDiff": 25, "OBV": 20, }):
+    def trend_strength_score(self):
         """
         Creates a trend strength score based on a variety of factors.
-        Generates self.df columns: trendScore
-
-        Args:
-            weights (dict): Keys are columns to be used as weights, values are the weight of the column.
+        Weights provided from const.py.
+        Generates self.df columns: trend_score
 
         Returns:
             None
@@ -887,56 +989,56 @@ class TechnicalFormulas:
 
         subdf = self.df[[
             "close",
-            "movingAverageConvergenceDivergence",
-            "macdHist",
-            "dmiPlus",
-            "dmiMinus",
-            "OBV",
-            "averageDirectionalIndex",
-            "averageTrueRange20",
-            "bollingerRange20"
+            "macd",
+            "macd_hist",
+            "dmi_plus",
+            "dmi_minus",
+            "obv",
+            "adx",
+            "atr",
+            "bollinger_band_range"
         ]].copy()
 
-        subdf["closeDiff"] = utils.rolling_zscore(subdf["close"].diff())
-        subdf["dmiDiff"] = subdf["dmiPlus"] - subdf["dmiMinus"]
-        subdf["OBV"] = utils.rolling_zscore(subdf["OBV"])
+        subdf["close_diff"] = utils.rolling_zscore(subdf["close"].diff())
+        subdf["dmi_diff"] = subdf["dmi_plus"] - subdf["dmi_minus"]
+        subdf["obv"] = utils.rolling_zscore(subdf["obv"])
 
         # Scales some subdf values from -1 to 1
         subdf[[
-            "closeDiff",
-            "movingAverageConvergenceDivergence",
-            "dmiDiff",
-            "OBV"
+            "close_diff",
+            "macd",
+            "dmi_diff",
+            "obv"
         ]] = 2 * utils.scaler(
             "MinMax",
-            subdf[["closeDiff", "movingAverageConvergenceDivergence", "dmiDiff", "OBV"]],
+            subdf[["close_diff", "macd", "dmi_diff", "obv"]],
             return_as="pandas"
         ) - 1
 
         # Scales other subdf values from 0 to 1
         subdf[[
-            "averageDirectionalIndex",
-            "averageTrueRange20",
-            "bollingerRange20"
+            "adx",
+            "atr",
+            "bollinger_band_range"
         ]] = utils.scaler(
             "MinMax",
-            subdf[["averageDirectionalIndex", "averageTrueRange20", "bollingerRange20"]],
+            subdf[["adx", "atr", "bollinger_band_range"]],
             return_as="pandas"
         )
 
         # Calculates initial trend scores
-        weight_sum = sum(weights.values())
+        weight_sum = sum(TREND_STRENGTH_SCORING.values())
         trend_score = sum(
             subdf[col] * weight
-            for col, weight in weights.items()
+            for col, weight in TREND_STRENGTH_SCORING.items()
         ) / weight_sum
 
         # ADX multiplier (0-2)
-        trend_score *= (subdf["averageDirectionalIndex"] * 2)
+        trend_score *= (subdf["adx"] * 2)
 
         # Takes adaptive MA
-        subdf["trendScore"] = self.kaufman_adaptive_moving_average(trend_score, 10, apply=False)
-        trend_score = subdf["trendScore"]
+        subdf["trend_score"] = self.kaufman_adaptive_moving_average(trend_score, 10, apply=False)
+        trend_score = subdf["trend_score"]
 
         # Separates positive trend scores and negative and scales them individually (-1 to 1)
         pos_scores = pd.Series(
@@ -957,172 +1059,190 @@ class TechnicalFormulas:
                 subset_scaled = subset_scaled * -1
 
             scores.append(subset_scaled)
-        self.df["trendScore"] = scores[0].fillna(scores[1])
+        self.df["trend_score"] = scores[0].fillna(scores[1])
+        return
+
+
+    def price_ceilings_floors(self, percentiles: tuple = (99, 1)):
+        """
+        Creates price ceilings and floors based on percentiles of daily price changes for each period.
+        Generates self.df columns: priceCeiling, priceFloor, priceChange.
+
+        Args:
+            percentiles (tuple): Top and bottom percentiles for price ceiling and floor.
+                Default is (99, 1).
+
+        Returns:
+            None
+        """
+        # Separates self.df into multiple DataFrames by date
+        buckets = utils.bucketizer(self.df[["date", "close"]].copy())
+
+        ceilings = []
+        floors = []
+        diffs = []
+        for df in buckets:
+            # Calculates daily change in price and percentiles of those changes
+            price_changes = df["close"].diff()
+            ceiling = utils.percentile(price_changes, percentiles[0])
+            floor = utils.percentile(price_changes, percentiles[1])
+
+            # Applies current ceilings and floors to detect extreme price changes
+            diffs.append(price_changes)
+            ceilings.append(df["close"].shift(1) + ceiling)
+            floors.append(df["close"].shift(1) + floor)
+
+        self.df["daily_price_change"] = np.concatenate(diffs)
+        self.df["daily_price_ceiling"] = np.concatenate(ceilings)
+        self.df["daily_price_floor"] = np.concatenate(floors)
+
+        # Will apply formula variables as attributes via df.attrs or dict and saved to models db
+        #self.df.price_ceilings_floors_percentiles = percentiles
         return
 
     def trend_swing_confirmation(self, window=5):
         """
         Calculates dynamic trend retracement targets based on trend swings.
-        Generates self.df columns: retracementThresholdCrossover, retracementThreshold, retracementTrend, retraceConfidence
+        Generates self.df columns: trend_reversal_type, trend_reversal_threshold, current_trend, trend_confidence_factor
 
         Args:
-            window (int): window size for masks.
+            window (int, optional): Window size for swing point detection. Defaults to 5.
 
         Returns:
             None
         """
+        # Select required columns once to avoid repeated copying
         subdf = self.df[[
-            "trendScore",
+            "trend_score",
             "high",
             "low",
             "close",
-            "averageDirectionalIndex",
-            "macdHist",
-            "bollingerSMA20",
-            "averageTrueRange20"
+            "adx",
+            "macd_hist",
+            "bollinger_sma",
+            "atr"
         ]].copy()
 
-        # Initializes masks for swing point detection
-        high_mask = np.ones(len(subdf), dtype=bool)
-        low_mask = np.ones(len(subdf), dtype=bool)
+        # Vectorized swing point detection using rolling max/min
+        high_mask = (subdf['high'].rolling(
+            window=2 * window + 1,
+            center=True,
+            min_periods=window
+        ).max() == subdf['high'])
 
-        for i in range(1, window + 1):
-            # Vectorized comparison with shifted values
-            high_shift = subdf['high'].shift(i).fillna(float('-inf')).values
-            low_shift = subdf['low'].shift(i).fillna(float('inf')).values
-
-            # Update masks for each position in the lookback window
-            high_mask &= (subdf['high'].values >= high_shift)
-            low_mask &= (subdf['low'].values <= low_shift)
-
-        # Identifies high and low points in the lookback window
-        high_indices = np.where(high_mask)[0]
-        low_indices = np.where(low_mask)[0]
+        low_mask = subdf['low'].rolling(
+            window=2 * window + 1,
+            center=True,
+            min_periods=window
+        ).min() == subdf['low']
 
         # Initialize swing point columns
-        subdf["swingHigh"] = np.nan
-        subdf["swingLow"] = np.nan
+        subdf["swing_high"] = np.where(high_mask, subdf["high"], np.nan)
+        subdf["swing_low"] = np.where(low_mask, subdf["low"], np.nan)
 
-        # Process high points
-        last_high_idx = 0
-        for idx in high_indices:
-            if idx >= window and idx - last_high_idx >= window:
-                subdf.iloc[idx, subdf.columns.get_loc("swingHigh")] = subdf['high'].iloc[idx]
-                last_high_idx = idx
+        # Ensure minimum distance between swing points using cumulative indexing
+        high_indices = subdf.index[high_mask].to_numpy()
+        low_indices = subdf.index[low_mask].to_numpy()
 
-        # Process low points
-        last_low_idx = 0
-        for idx in low_indices:
-            if idx >= window and idx - last_low_idx >= window:
-                subdf.iloc[idx, subdf.columns.get_loc("swingLow")] = subdf['low'].iloc[idx]
-                last_low_idx = idx
+        # Filter indices to enforce minimum window distance
+        valid_highs = [high_indices[0]] if len(high_indices) > 0 else []
+        for idx in high_indices[1:]:
+            if idx - valid_highs[-1] >= window:
+                valid_highs.append(idx)
 
-        # Forward-fill swing points
-        subdf["lastSwingHigh"] = subdf["swingHigh"].ffill()
-        subdf["lastSwingLow"] = subdf["swingLow"].ffill()
+        valid_lows = [low_indices[0]] if len(low_indices) > 0 else []
+        for idx in low_indices[1:]:
+            if idx - valid_lows[-1] >= window:
+                valid_lows.append(idx)
 
-        # Handle null values by using the first high/low
-        subdf["lastSwingHigh"] = subdf["lastSwingHigh"].fillna(subdf["high"].iloc[0])
-        subdf["lastSwingLow"] = subdf["lastSwingLow"].fillna(subdf["low"].iloc[0])
+        # Update swing points only at valid indices
+        subdf.loc[valid_highs, "swing_high"] = subdf.loc[valid_highs, "high"]
+        subdf.loc[valid_lows, "swing_low"] = subdf.loc[valid_lows, "low"]
+
+        # Forward-fill swing points and handle initial nulls
+        subdf["last_swing_high"] = subdf["swing_high"].ffill().fillna(subdf["high"].iloc[0])
+        subdf["last_swing_low"] = subdf["swing_low"].ffill().fillna(subdf["low"].iloc[0])
 
         # Calculate swing range
-        subdf["swingRange"] = subdf["lastSwingHigh"] - subdf["lastSwingLow"]
+        subdf["swing_range"] = subdf["last_swing_high"] - subdf["last_swing_low"]
 
         # Base confidence from trend strength score
-        confidence_factor = abs(subdf["trendScore"]).clip(0, 1)
+        confidence_factor = subdf["trend_score"].abs().clip(0, 1)
 
         # Fibonacci retracement levels
         fib_shallow = 0.382
         fib_deep = 0.618
 
-        # Create dynamic retracement level based on trend confidence
-        subdf["fibRetracementLevel"] = fib_shallow + (confidence_factor * (fib_deep - fib_shallow))
+        # Dynamic retracement level
+        subdf["fib_retracement_level"] = fib_shallow + (confidence_factor * (fib_deep - fib_shallow))
 
-        # Calculate retracement target price based on trend direction
-        subdf["retracementTarget"] = np.where(
-            subdf["trendScore"] > 0,
-            subdf["lastSwingHigh"] - (subdf["swingRange"] * subdf["fibRetracementLevel"]),  # Support
-            subdf["lastSwingLow"] + (subdf["swingRange"] * subdf["fibRetracementLevel"])  # Resistance
+        # Vectorized retracement target calculation
+        subdf["reversal_target"] = np.where(
+            subdf["trend_score"] > 0,
+            subdf["last_swing_high"] - (subdf["swing_range"] * subdf["fib_retracement_level"]),
+            subdf["last_swing_low"] + (subdf["swing_range"] * subdf["fib_retracement_level"])
         )
 
-        # Checks if the trend direction changes
-        trend_direction_change = (np.sign(subdf["trendScore"]) != np.sign(subdf["trendScore"].shift(1))) & (subdf["trendScore"].shift(1) != 0)
-
-        # Checks if the trend direction has changed in the last 10 periods
+        # Detect trend direction changes
+        trend_direction_change = (np.sign(subdf["trend_score"]) != np.sign(subdf["trend_score"].shift(1))) & (
+                    subdf["trend_score"].shift(1) != 0)
         recent_trend_change = trend_direction_change.rolling(10).sum() > 0
 
-        # Conditions to identify a weak trend (low trend score or recent trend change)
-        weak_trend = (abs(subdf["trendScore"]) < utils.percentile(abs(subdf["trendScore"]), 30)) | recent_trend_change
+        # Identify weak trends
+        weak_trend = (subdf["trend_score"].abs() < subdf["trend_score"].abs().quantile(0.3)) | recent_trend_change
 
-        # Volatility adjustment factor (less buffer for strong trends, more for weak trends)
+        # Volatility adjustment
         volatility_buffer = 4 - (confidence_factor * 0.5)
-
-        subdf["retracementThreshold"] = np.where(
-            subdf["trendScore"] > 0,
-            # In uptrend: support lowered by volatility factor (creates buffer zone)
-            subdf["retracementTarget"] - (subdf["averageTrueRange20"] * volatility_buffer),
-
-            # In downtrend: resistance raised by volatility factor
-            subdf["retracementTarget"] + (subdf["averageTrueRange20"] * volatility_buffer)
+        subdf["reversal_threshold"] = np.where(
+            subdf["trend_score"] > 0,
+            subdf["reversal_target"] - (subdf["atr"] * volatility_buffer),
+            subdf["reversal_target"] + (subdf["atr"] * volatility_buffer)
         )
 
-        # Apply a slow and fast adaptive MA to support/resistance thresholds
-        kama_fast = self.kaufman_adaptive_moving_average(subdf["retracementThreshold"], 10, apply=False)
-        kama_slow = self.kaufman_adaptive_moving_average(subdf["retracementThreshold"], 20, apply=False)
+        # Adaptive moving averages
+        kama_fast = self.kaufman_adaptive_moving_average(subdf["reversal_threshold"], 10, apply=False)
+        kama_slow = self.kaufman_adaptive_moving_average(subdf["reversal_threshold"], 20, apply=False)
         blend_weight = np.where(weak_trend, 0.95, 0.4)
+        threshold = pd.Series((kama_slow * blend_weight) + (kama_fast * (1 - blend_weight)))
 
-        # Calculates the weighted average of the slow and fast adaptive MA thresholds with blend weight
-        threshold = pd.Series(
-            (kama_slow * blend_weight) + (kama_fast * (1 - blend_weight))
-        )
+        # Calculate retracement slope
+        retracement_slope = pd.Series(utils.line_best_fit(threshold, 10))
+        slope_up_thresh = retracement_slope.quantile(0.8)
+        slope_down_thresh = retracement_slope.quantile(0.2)
 
-        # Finds slope of the retracement threshold line
-        retracement_slope = pd.Series(utils.lineBestFit(threshold, 10))
-
-        # Finds thresholds for strong retracement up or down slopes
-        slope_up_thresh = utils.percentile(retracement_slope, 80)
-        slope_down_thresh = utils.percentile(retracement_slope, 20)
-
-        close = self.df["close"]
-        # When the threshold crosses over closing price in either direction
+        # Detect reversals
+        close = pd.Series(subdf["close"])
         reversal_conditions = (
             (threshold.shift(1) < close.shift(1)) & (threshold > close),
             (threshold.shift(1) > close.shift(1)) & (threshold < close)
         )
-
-        # These threshold/close crossovers are considered trend reversals
-        reversals = pd.Series(np.select(reversal_conditions, ["toDown", "toUp"], "None"))
+        reversals = pd.Series(np.select(reversal_conditions, ["to_down", "to_up"], "None"))
         reversal_idxs = reversals[reversals != "None"].index
 
-        # Confirms crossovers by checking if there are 30 periods between crossover events
-        self.df["reversalConf"] = "None"
+        # Confirm reversals
+        self.df["reversal_conf"] = "None"
         for i, idx in enumerate(reversal_idxs):
             try:
-                next_idx = reversal_idxs[i+1]
+                next_idx = reversal_idxs[i + 1]
             except IndexError:
-                next_idx = len(reversals) - 1
+                next_idx = len(reversals)
 
             slope_segment = retracement_slope.iloc[idx:next_idx]
             if len(slope_segment) < 30:
                 continue
 
-            # Further confirms crossovers by checking if the retracement threshold segment between crossover events contains a strong up/down slope
             reversal_type = reversals.iloc[idx]
-            if reversal_type == "toUp":
-                try:
-                    pos_slope = slope_segment[slope_segment > slope_up_thresh].index[0]
-                except IndexError:
-                    continue
-                self.df.loc[pos_slope, "reversalConf"] = reversal_type
-            elif reversal_type == "toDown":
-                try:
-                    neg_slope = slope_segment[slope_segment < slope_down_thresh].index[0]
-                except IndexError:
-                    continue
-                self.df.loc[neg_slope, "reversalConf"] = reversal_type
+            if reversal_type == "to_up":
+                pos_slope = slope_segment[slope_segment > slope_up_thresh].index
+                if not pos_slope.empty:
+                    self.df.loc[pos_slope[0], "reversal_conf"] = reversal_type
+            elif reversal_type == "to_down":
+                neg_slope = slope_segment[slope_segment < slope_down_thresh].index
+                if not neg_slope.empty:
+                    self.df.loc[neg_slope[0], "reversal_conf"] = reversal_type
 
-        self.df["retracementThresholdCrossover"] = reversals
-        self.df["retracementThreshold"] = threshold
-        self.df["retracementTrend"] = np.where(self.df["retracementThreshold"] > self.df["close"], -1, 1)
-        self.df["retraceConfidence"] = confidence_factor
-        return
+        # Assign final columns to self.df
+        self.df["trend_reversal_type"] = reversals
+        self.df["trend_reversal_threshold"] = threshold
+        self.df["current_trend"] = np.where(threshold > subdf["close"], -1, 1)
+        self.df["trend_confidence_factor"] = confidence_factor

@@ -5,55 +5,43 @@ Created on Mon Dec  9 15:59:57 2024
 
 @author: cjymain
 """
-from technically.utils.handlers.db import DuckDB
-from technically.utils.log import log_method, get_logger
-from technically.utils.exceptions import (
-    NotEnoughDataError,
-    DeadTickerError
-)
+from technically.utils.handlers.db import PostgreSQL
+from technically.utils.log import get_logger, timer
+from technically.const import TC_PATH, MIN_PERIODS
 
+import traceback
 from glob import glob
 import shutil
-import os
 
 
 class DatabaseChecks:
     """
-    Deletes deadTicker data, then vacuums DuckDB to reclaim disk space.
+    Deletes dead_ticker data and ensures data reliability.
     """
 
-    def __init__(self, base_path: str, friday: bool):
-        self.base_path = base_path
-        self.friday = friday
-        self.price_db = base_path + "/sql/prices.duck"
-        self.fund_db = base_path + "/sql/fundamentals.duck"
-        self.model_db = base_path + "/sql/models.duck"
-
+    @timer()
     def execute(self):
         # Open multiple database connections simultaneously
-        with DuckDB(self.price_db) as db:
-            self.tickers_df = db.sql('''
+        with PostgreSQL() as self.conn:
+            extract_tickers_query = '''
                 SELECT
-                    CASE 
-                        WHEN duplicated = False THEN ticker 
-                        ELSE permaTicker 
-                    END AS ticker,
+                    table_alias as ticker,
                     exchange,
-                    capCategory,
+                    cap_category,
                     sector,
                     designation,
-                    pricesInitialized,
-                    fundamentalsInitialized
+                    prices_initialized,
+                    fundamentals_initialized
                 FROM 
-                    metadata;
+                    prices.metadata;
                 '''
-            ).df()
+            self.tickers_df = self.conn.run_query(
+                extract_tickers_query,
+                return_as="pandas"
+            )
 
         self.remove_dead_tickers()
         self.remove_duplicate_parquet()
-        # Needs to re-connect to databases (context block for above connections closed)
-        if type(self.friday) == int:
-            self.vacuum_db()
 
     def remove_duplicate_parquet(self):
         """
@@ -65,16 +53,28 @@ class DatabaseChecks:
 
         for idx, row in self.tickers_df.iterrows():
             # How parquet directories format spaces
-            row['sector'] = row['sector'].replace(' ', '%20')
+            try:
+                row['sector'] = row['sector'].replace(' ', '%20')
+            except AttributeError:  # Sector is None
+                continue
 
             for pq_type in ["daily", "quarterly"]:
-                ticker_parquet_paths = glob(self.base_path + f"/parquet/{pq_type}/**/ticker={row['ticker']}", recursive=True)
+                ticker_parquet_paths = glob(
+                    TC_PATH + f"/parquet/{pq_type}/**/ticker={row['ticker']}",
+                    recursive=True
+                )
                 if len(ticker_parquet_paths) > 1:
                     for path in ticker_parquet_paths:
                         # Path to ticker's parquet does not match its metadata (metadata has changed)
-                        if path != f"{self.base_path}/parquet/{pq_type}/exchange={row['exchange']}/cap={row['capCategory']}/sector={row['sector']}/ticker={row['ticker']}":
+                        if path != (f"{TC_PATH}/parquet/{pq_type}/exchange={row['exchange']}/"
+                                    f"cap={row['cap_category']}/sector={row['sector']}/ticker={row['ticker']}"):
                             shutil.rmtree(path)
-                            get_logger().info(f"Removed duplicate {pq_type} parquet for {row['ticker']} at {path}.")
+                            get_logger().info(
+                                f"Removed duplicate {pq_type} parquet.", extra={
+                                    "item_id": row["ticker"],
+                                    "path": path
+                                }
+                            )
 
     def remove_dead_tickers(self):
         """
@@ -86,227 +86,249 @@ class DatabaseChecks:
 
         # Extracts tickers designated as 'dead' and ensures that have not already been removed from databases
         dead_tickers = self.tickers_df['ticker'][
-            (self.tickers_df['designation'] == 'deadTicker') &
-            (self.tickers_df['pricesInitialized'] == True) &
-            (self.tickers_df['fundamentalsInitialized'] == True)
+            (self.tickers_df['designation'] == 'dead_ticker') &
+            (self.tickers_df['prices_initialized'] == True) &
+            (self.tickers_df['fundamentals_initialized'] == True)
         ].tolist()
 
         for ticker in dead_tickers:
-            with DuckDB(self.price_db) as db:
-                # Updates its metadata entry
-                db.execute('''
-                    UPDATE
-                        metadata
-                    SET
-                        pricesInitialized = false,
-                        lastPricesCheck = DEFAULT,
-                        fundamentalsInitialized = false,
-                        lastFundamentalsCheck = DEFAULT
-                    WHERE
-                        CASE
-                            WHEN duplicated = False THEN ticker 
-                            ELSE permaTicker END = ?;
-                    ''', [ticker]
-                )
+            # Updates its metadata entry
+            dead_ticker_meta_query = '''
+                UPDATE
+                    prices.metadata
+                SET
+                    prices_initialized = false,
+                    newest_db_prices = DEFAULT,
+                    fundamentals_initialized = false,
+                    newest_db_statements = DEFAULT
+                WHERE
+                    table_alias = :ticker;
+                '''
+            self.conn.run_query(
+                dead_ticker_meta_query,
+                params={"ticker": ticker},
+                commit=True
+            )
 
-                # Drops price table
-                db.execute(f'''
-                    DROP TABLE IF EXISTS "{ticker}";
-                    '''
-                )
+            # Drops price table
+            drop_price_query = '''
+                DROP TABLE IF EXISTS prices.{ticker};
+                '''
+            self.conn.run_query(
+                drop_price_query,
+                params={"ticker": ticker},
+                commit=True
+            )
 
-            with DuckDB(self.fund_db) as db:
-                # Drops fundamentals tables
-                db.execute(f'''
-                    DROP TABLE IF EXISTS "{ticker}_incomeStatement";
-                    '''
-                )
-                db.execute(f'''
-                    DROP TABLE IF EXISTS "{ticker}_balanceSheet";
-                    '''
-                )
-                db.execute(f'''
-                    DROP TABLE IF EXISTS "{ticker}_cashFlow";
-                    '''
-                )
+            # Drops fundamentals tables
+            drop_inc_stmt_query = '''
+                DROP TABLE IF EXISTS fundamentals.{ticker}_income_statement;
+                '''
+            self.conn.run_query(
+                drop_inc_stmt_query,
+                params={"ticker": ticker},
+                commit=True
+            )
+            drop_balance_sheet_query = '''
+                DROP TABLE IF EXISTS fundamentals.{ticker}_balance_sheet;
+                '''
+            self.conn.run_query(
+                drop_balance_sheet_query,
+                params={"ticker": ticker},
+                commit=True
+            )
+            drop_cash_flow_query = '''
+                DROP TABLE IF EXISTS fundamentals.{ticker}_cash_flow;
+                '''
+            self.conn.run_query(
+                drop_cash_flow_query,
+                params={"ticker": ticker},
+                commit=True
+            )
 
-            with DuckDB(self.model_db) as db:
-                # Drops models data
-                db.execute(f'''
-                    DELETE FROM indicatorSuccessRates 
-                        WHERE ticker = ?;
-                    ''', [ticker]
-                )
+            # Drops models data
+            drop_models_query = '''
+                DELETE FROM models.signal_success_rates 
+                    WHERE ticker = :ticker;
+                '''
+            self.conn.run_query(
+                drop_models_query,
+                params={"ticker": ticker},
+                commit=True
+            )
 
-            try:
-                # Removes parquet files associated with ticker
-                for pq_path in glob(self.base_path+f"/parquet/**/ticker={ticker}", recursive=True):
+            # Removes parquet files associated with ticker
+            for pq_path in glob(TC_PATH + f"/parquet/**/ticker={ticker}", recursive=True):
+                try:
                     shutil.rmtree(pq_path)
-            except Exception as e:
-                get_logger().error(f"Dead ticker {ticker} could not have its parquet removed: {str(e)}")
-                continue
-
-            get_logger().info(f"Dead ticker {ticker} removed.")
-
-    @log_method
-    def vacuum_db(self):
-        """
-        Vacuums (in effect) all connected databases.
-
-        Returns:
-            None
-        """
-
-        for db_path in [self.price_db, self.fund_db, self.model_db]:
-            # Extracts database name
-            name = db_path.split("/")[-1].split(".")[0]
-
-            # Creates new database name/path
-            altered_path = db_path.replace(".duck", ".duck.old")
-
-            # Renames existing db
-            os.rename(db_path, altered_path)
-
-            # Connects to original database path (creates new database)
-            try:
-                with DuckDB(db_path) as db:
-                    # Attaches renamed (old) database to new database
-                    db.execute(f'''
-                        ATTACH '{altered_path}' 
-                        AS existingdb;
-                        '''
+                except Exception:
+                    get_logger().error(
+                        "A dead ticker could not have its parquet removed.", extra={
+                            "item_id": ticker,
+                            "path": pq_path,
+                            "error": traceback.format_exc()
+                        }
                     )
-                    # Copy from existing DB to new DB (saves disk space)
-                    db.execute(f'''
-                        COPY FROM DATABASE existingdb 
-                        TO {name};
-                        '''
-                    )
-            except Exception:
-                get_logger().error(f"Could not vacuum {name} database.")
-                # If error, restores old database
-                os.rename(altered_path, db_path)
-                continue
+                    continue
 
-            # Removes old database once complete
-            os.remove(altered_path)
-        return
+                get_logger().info(
+                    "Dead ticker's data deleted.", extra={
+                        "item_id": ticker,
+                        "path": pq_path
+                    }
+                )
 
 
 class PriceAdjustments:
     """
-    Examines price data for corporate actions (splits, dividends) and adjusts/unadjusts for them.
+    Examines price data for corporate actions (splits, dividends) and adjusts or un-adjusts for them.
     """
 
-    def __init__(self, base_path, price_df, columns_to_adjust=("open", "high", "low", "close", "volume")):
-        self.price_db = base_path + "/sql/prices.duck"
+    def __init__(self, price_df, columns_to_adjust=("open", "high", "low", "close", "volume")):
         self.df = price_df
         self.columns = columns_to_adjust
 
-    def priceActivityCheck(self, ticker: str, threshold=25000):
+    def price_activity_check(self, ticker: str, threshold=25000):
         """
         Cuts out data points where price activity is lower than threshold.
-        Tickers are assigned different designations based on whether the most recent period is cut off ("deadTicker")
-        or if the valid stretches of data are less than 120 periods ("notEnoughData").
+        Tickers are assigned different designations based on whether the most recent period is cut off ("dead_ticker")
+        or if the valid stretches of data are less than MIN_PERIODS periods ("not_enough_data").
 
         Args:
             ticker (str): Ticker symbol.
-            thresh (int): The minimum 5-day average in dollars traded (share price * volume) for a ticker to remain active.
+            threshold (int): The minimum 5-day average in dollars traded (share price * volume) for a ticker to remain active.
         """
 
-        self.df["date"] = self.df["date"].astype(str)
+        with PostgreSQL() as conn:
+            self.df["date"] = self.df["date"].astype(str)
 
-        df_len = len(self.df)
+            df_len = len(self.df)
 
-        # Tickers with less than 120 periods skipped
-        if df_len < 120:
-            with DuckDB(self.price_db) as db:
-                db.execute('''
-                           UPDATE
-                               metadata
-                           SET designation = 'notEnoughData'
-                           WHERE CASE
-                                     WHEN duplicated = False THEN ticker
-                                     ELSE permaTicker END = ?
-                             AND isActive = true;
-                           ''', [ticker]
-                           )
-                get_logger().warning(NotEnoughDataError(ticker, df_len))
-            return False
+            # Tickers with less than global var MIN_PERIODS rows skipped
+            if df_len < MIN_PERIODS:
+                designation_update_query = '''
+                   UPDATE
+                       prices.metadata
+                   SET designation = 'not_enough_data'
+                   WHERE 
+                     table_alias = :ticker
+                     AND is_active = true;
+                    '''
+                conn.run_query(
+                    designation_update_query,
+                    params={"ticker": ticker},
+                    commit=True
+                )
 
-        # Finds where a 5-day MA of dollarsTraded is less than threshold
-        dollarsTraded = self.df["close"] * self.df["volume"]
-        weekly_volume_sums = dollarsTraded.rolling(window=20).mean()
-        violations = self.df["date"][weekly_volume_sums <= threshold].tolist()
+                get_logger().warning(
+                    "Not enough data to conduct analysis.", extra={
+                        "item_id": ticker
+                    }
+                )
+                return False
 
-        # All dates pass check
-        if violations == []:
-            return True
+            # Finds where a 5-day MA of dollarsTraded is less than threshold
+            dollarsTraded = self.df["close"] * self.df["volume"]
+            weekly_volume_sums = dollarsTraded.rolling(window=20).mean()
+            violations = self.df["date"][weekly_volume_sums <= threshold].tolist()
 
-        # Filter violations out
-        df_filtered = self.df[~self.df["date"].isin(violations)].copy()
+            # All dates pass check
+            if violations == []:
+                return True
 
-        # Measures length of passing sequences
-        index_diffs = df_filtered.index.to_series().diff().fillna(1)
-        sequences = (index_diffs != 1).cumsum()
+            # Filter violations out
+            df_filtered = self.df[~self.df["date"].isin(violations)].copy()
 
-        # Filters out failing sequences
-        df_filtered.loc[:, 'idx_group'] = sequences
-        sequence_sizes = df_filtered.groupby("idx_group").size()
+            # Measures length of passing sequences
+            index_diffs = df_filtered.index.to_series().diff().fillna(1)
+            sequences = (index_diffs != 1).cumsum()
 
-        # Filters out passing sequences less than 120
-        valid_sequences = sequence_sizes[sequence_sizes > 120].index
+            # Filters out failing sequences
+            df_filtered.loc[:, 'idx_group'] = sequences
+            sequence_sizes = df_filtered.groupby("idx_group").size()
 
-        # Final filter
-        passing_dates = tuple(
-            df_filtered["date"][df_filtered['idx_group'].isin(valid_sequences)]
-        )
+            # Filters out passing sequences less than MIN_PERIODS
+            valid_sequences = sequence_sizes[sequence_sizes > MIN_PERIODS].index
 
-        with DuckDB(self.price_db) as db:
+            # Final filter
+            passing_dates = tuple(
+                df_filtered["date"][df_filtered['idx_group'].isin(valid_sequences)]
+            )
+
             if passing_dates == ():  # No passing sequences
-                db.execute('''
-                           UPDATE
-                               metadata
-                           SET designation     = 'deadTicker',
-                               lastPricesCheck = DEFAULT
-                           WHERE CASE
-                                     WHEN duplicated = False THEN ticker
-                                     ELSE permaTicker END = ?;
-                           ''', [ticker]
-                           )
-                get_logger().warning(DeadTickerError(ticker))
+                set_dead_ticker_query = '''
+                    UPDATE
+                        prices.metadata
+                    SET 
+                        designation = 'dead_ticker',
+                        newest_db_prices = DEFAULT
+                    WHERE 
+                        table_alias = :ticker;
+                   '''
+                conn.run_query(
+                    set_dead_ticker_query,
+                    params={"ticker": ticker},
+                    commit=True
+                )
+                get_logger().info(
+                    "Ticker inactive and designated as 'dead_ticker'.", extra={
+                        "item_id": ticker
+                    }
+                )
                 return False
             elif passing_dates[-1] == self.df.date.values[-1]:  # Most recent data passes
-                db.execute(f'''
-                    DELETE FROM "{ticker}"
+                remove_inactive_rows_query = '''
+                    DELETE FROM 
+                        prices.{ticker}
                     WHERE 
-                        date < ?;
-                    ''', [passing_dates[0]]
-                           )
-                get_logger().info(f"Dates preceding {passing_dates[0]} have been removed from {ticker}.")
-                return False
+                        date < :date_cutoff;
+                    '''
+                conn.run_query(
+                    remove_inactive_rows_query,
+                    params={"ticker": ticker, "date_cutoff": passing_dates[0]},
+                    commit=True
+                )
+                get_logger().info(
+                    f"Dates preceding {passing_dates[0]} have been removed due to inadequate price activity.", extra={
+                        "item_id": ticker
+                    }
+                )
+                return True
             else:  # Some historical data passes
-                db.execute(f'''
-                    DELETE FROM "{ticker}"
-                    WHERE date > ?;
-                    ''', [passing_dates[-1]]
-                           )
-                db.execute(f'''
-                    UPDATE 
-                        metadata
-                    SET 
-                        designation = 'recentDatesInactive',
-                        lastPricesCheck = ?
+                remove_inactive_rows_query = '''
+                    DELETE FROM 
+                        prices.{ticker}
                     WHERE 
-                        CASE 
-                            WHEN duplicated = False THEN ticker 
-                            ELSE permaTicker END = ?;
-                    ''', [passing_dates[-1], ticker]
-                           )
-                get_logger().info(f"Dates exceeding {passing_dates[-1]} have been removed from {ticker}.")
+                        date > :date_cutoff;
+                    '''
+                conn.run_query(
+                    remove_inactive_rows_query,
+                    params={"ticker": ticker, "date_cutoff": passing_dates[-1]},
+                    commit=True
+                )
+
+                set_recent_inactive_query = '''
+                    UPDATE 
+                        prices.metadata
+                    SET 
+                        designation = 'recent_dates_inactive',
+                        newest_db_prices = :date_cutoff
+                    WHERE 
+                        table_alias = :ticker;
+                    '''
+                conn.run_query(
+                    set_recent_inactive_query,
+                    params={"ticker": ticker, "date_cutoff": passing_dates[-1]},
+                    commit=True
+                )
+                get_logger().info(
+                    f"Dates exceeding {passing_dates[-1]} have been removed due to inadequate price activity.", extra={
+                        "item_id": ticker
+                    }
+                )
                 return False
 
-def adjustForSplits(df):
+def adjust_for_splits(df):
     """
     Adjusts incoming Tiingo price data for splits, accounting for API inconsistency in applying stock splits.
 
@@ -316,13 +338,13 @@ def adjustForSplits(df):
     Returns:
         df (pd.DataFrame): Dataframe containing adjusted and rounded Tiingo price data.
     """
-    for idx in df.index[df["splitFactor"] != 1]:
+    for idx in df.index[df["split_factor"] != 1]:
         if idx == 0:
             continue
         close = df["close"].loc[idx]
 
-        # Close previous the split with the splitFactor applied
-        prev_close = df["close"].loc[idx - 1] / df["splitFactor"].loc[idx]
+        # Close previous the split with the split_factor applied
+        prev_close = df["close"].loc[idx - 1] / df["split_factor"].loc[idx]
         likely_split = prev_close + (prev_close * 0.25) > close > prev_close - (prev_close * 0.25)
         if not likely_split:
             continue
@@ -330,25 +352,25 @@ def adjustForSplits(df):
         for column in df.columns:  # Applies split-factor
             if column == "volume":
                 df.loc[:idx - 1, column] = (
-                        df.loc[:idx - 1, column] * df.loc[idx, "splitFactor"]
+                        df.loc[:idx - 1, column] * df.loc[idx, "split_factor"]
                 ).round().astype("int64")
             elif column in ["open", "high", "low", "close"]:
-                df.loc[:idx - 1, column] /= df.loc[idx, "splitFactor"]
+                df.loc[:idx - 1, column] /= df.loc[idx, "split_factor"]
     return df.round(4)
 
 
-def unadjustForSplits(df):  # Currently unused
-    for idx in df.index[df["splitFactor"] != 1]:  # Finds splits
+def unadjust_for_splits(df):  # Currently unused
+    for idx in df.index[df["split_factor"] != 1]:  # Finds splits
         for column in df.columns:  # Applies split-factor
             if column == "volume":
                 df.loc[:idx - 1, column] = (
-                        df.loc[:idx - 1, column] / df.loc[idx, "splitFactor"]
+                        df.loc[:idx - 1, column] / df.loc[idx, "split_factor"]
                 ).round().astype("int64")
             elif column in ["open", "high", "low", "close"]:
-                df.loc[:idx - 1, column] *= df.loc[idx, "splitFactor"]
+                df.loc[:idx - 1, column] *= df.loc[idx, "split_factor"]
     return df.round(4)
 
-def marketCapCategory(cap: int or float):
+def market_cap_category(cap: int | float):
     """
     Assigns a market cap category for a ticker based on its most current market cap value.
 
@@ -360,15 +382,15 @@ def marketCapCategory(cap: int or float):
     """
     try:
         if cap >= 2.0 * (10 ** 11):
-            return "Mega"
+            return "mega"
         elif cap >= 1.0 * (10 ** 10):
-            return "Large"
+            return "large"
         elif cap >= 2.0 * (10 ** 9):
-            return "Mid"
+            return "mid"
         elif cap >= 3.0 * (10 ** 8):
-            return "Small"
+            return "small"
         else:
-            return "Micro"
+            return "micro"
     except TypeError:  # Market cap is null
-        return "Unknown"
+        return "unknown"
 

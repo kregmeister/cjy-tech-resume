@@ -6,36 +6,62 @@ Created on Wed Mar 19 11:41:42 2025
 @author: cjymain
 """
 
+import json
+import time
+from pythonjsonlogger import jsonlogger
 import logging
 import traceback
 from functools import wraps
+import os
+import inspect
 
 
-def log_setup(level, file_location):
-    log_format = logging.Formatter(
-        '%(asctime)s FROM %(filename)s VIA %(funcName)s ON %(lineno)d [%(levelname)s]: %(message)s',
-        '%Y-%m-%d %I:%M:%S %p'
-    )
+class CustomJsonFormatter(jsonlogger.JsonFormatter):
+    def add_fields(self, log_record, record, message_dict):
+        super().add_fields(log_record, record, message_dict)
+        log_record['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        log_record['level'] = record.levelname
+        log_record['message'] = record.msg
 
-    # Configure boto3 and botocore to not excessively log
-    logging.getLogger("boto3").setLevel(logging.WARNING)
-    logging.getLogger("botocore").setLevel(logging.WARNING)
+        # Formats newlines properly when tracebacks are logged
+        if 'error' in log_record and log_record['error'] and isinstance(log_record['error'], str):
+            log_record['error'] = log_record['error'].splitlines()
+
+    def format(self, record):
+        log_record = {}
+        self.add_fields(log_record, record, {})
+        return json.dumps(log_record, indent=4)
+
+def log_setup(date, base_path, log_name="default"):
+    """
+    Configures logging.
+
+    Args:
+        date (date): Date of log.
+        base_path (str): Base path for log location.
+        log_name (str, optional): Defaults to the default log name for automated script execution.
+            Set to a custom name in testing scenarios.
+
+    Returns:
+        logger
+    """
+    log_dir = base_path + "/logs/dev/"
+    os.makedirs(log_dir, exist_ok=True)
+
+    if log_name == "default":
+        log_path = log_dir + f"tc_{date}.log"
+    else:
+        log_path = log_dir + log_name  # Custom log name
 
     logger = logging.getLogger("technically")
-    if level == "DEBUG":
-        logger.setLevel(logging.DEBUG)
-    elif level == "INFO":
-        logger.setLevel(logging.INFO)
-    elif level == "WARNING":
-        logger.setLevel(logging.WARNING)
-    elif level == "ERROR":
-        logger.setLevel(logging.ERROR)
-    elif level == "CRITICAL":
-        logger.setLevel(logging.CRITICAL)
+    logger.setLevel(logging.INFO)
 
-    file_handler = logging.FileHandler(file_location, mode='w')
-    file_handler.setFormatter(log_format)
+    formatter = CustomJsonFormatter(
+        '%(timestamp)s %(level)s %(filename)s %(funcName)s %(lineno)s %(message)s %(item_id)s %(duration_sec)s %(error)s'
+    )
 
+    file_handler = logging.FileHandler(log_path, mode="w")
+    file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
     return logger
@@ -44,69 +70,95 @@ def get_logger():
     logger = logging.getLogger("technically")
     return logger
 
-def log_class(cls=None, exclude=[], critical=False):
-    "Class decorator to log method calls."
-    exclude.extend(["execute"])
+def timer(_id: str = None, custom_fields: dict = {}, critical: bool = False):
+    """
+    Times and logs (to JSON) function calls.
+    Does not work on classes directly.
 
-    def decorator(cls):
-        for name, method in cls.__dict__.items():
-            if (callable(method) and
-                    not name.startswith("__") and
-                    not hasattr(method, '_is_logged') and
-                    name not in exclude):
-                setattr(cls, name, log_method(method, class_name=cls.__name__,
-                                              critical=critical)
-                )
-        return cls
+    Args:
+        item_id (str, optional): An identifier for the function/class.
+            Defaults to param value of param name "ticker" if present.
+            Other scenarios:
+            1. A param name from the function that's wrapped. The value will be "_id".
+            2. A custom string that will be the "_id".
+            Otherwise, "_id" will be null.
+        custom_fields (dict, optional): Additional custom fields to include in log submissions.
+            Keys are field names, values are integers representing the index location of the desired arg.
+        critical (bool, optional): If True, an uncaught error will terminate execution. Defaults to False.
 
-    if cls is None:
-        return decorator
-    return decorator(cls)
+    Returns:
+        Decorator:
+            Decorated function.
 
-def log_method(func=None, class_name=None, critical=False):
-    "Method decoratro that can be used directly or from log_class."
+    Example:
+        @timer(custom_fields={"url": 2})
+        def func(self, item_id, url):
+
+        Int "2" coincides with url being the third parameter in func.
+        Args[2] will be used to derive "url" value.
+    """
+
     def decorator(func):
         @wraps(func)
-        def wrapper(*args, **kwargs):
-            log = logging.getLogger('technically')
-
-            # Checks whether method is in a class
-            if args and hasattr(args[0], '__class__'):
-                real_class_name = class_name or args[0].__class__.__name__
-                method_name = func.__name__
-                log.debug(f'Entering {real_class_name}.{method_name}()')
-
-                try:
-                    result = func(*args, **kwargs)
-                    log.debug(f'Exiting {real_class_name}.{method_name}()')
-                    return result
-                except Exception as e:
-                    # Log exception with traceback
-                    log.error(f'Exception in {real_class_name}.{method_name}(): {str(e)}')
-                    log.error(f'Function parameters: {args}')
-                    log.error(f'Traceback: {traceback.format_exc()}')
-
-                    if critical:
-                        raise
-                    return
+        def timer_wrapper(*args, **kwargs):
+            if args and hasattr(args[0], "__class__"):
+                class_instance = args[0].__class__
+                exc_type = "Class"
+                class_name = class_instance.__name__
+                func_name = f"{class_name}.{func.__name__}"
+                # Dict of class __init__ argument names: values
+                class_args = vars(args[0])
+                if "ticker" in class_args.keys():
+                    class_id = class_args["ticker"]
             else:
-                log.debug(f'Entering {func.__name__}()')
-                try:
-                    result = func(*args, **kwargs)
-                    log.debug(f'Exiting {func.__name__}()')
-                    return result
-                except Exception as e:
-                    log.error(f'Exception in {func.__name__}(): {str(e)}')
-                    log.error(f'Function parameters: {args}')
-                    log.error(f'Traceback: {traceback.format_exc()}')
+                exc_type = "Function"
+                func_name = func.__name__
 
-                    if critical:
-                        raise
-                    return
+            # Dict of func argument names: values
+            func_param_names = func.__code__.co_varnames[:func.__code__.co_argcount]
+            func_args = dict(zip(func_param_names, args))
+            func_args.update(kwargs)
 
-        wrapper._is_logged = True
-        return wrapper
+            # Checks if _id is a param name for the func
+            if _id in func_args.keys():
+                item_id = func_args[_id]
+            elif 'class_id' in locals():
+                item_id = class_id
+            else:
+                item_id = _id
+            frame = inspect.stack()[1]
+            file_name = frame.filename.split("/")[-1]
+            extra_fields = {k: args[v] for k, v in custom_fields.items()}
 
-    if func is None:
-        return decorator
-    return decorator(func)
+            start = time.perf_counter()
+            try:
+                result = func(*args, **kwargs)
+            except Exception:
+                get_logger().error(
+                    "Uncaught exception. Please reference outer location and handle errors there.", extra={
+                        "item_id": item_id,
+                        "outer_location": func_name,
+                        "outer_filename": file_name,
+                        "error": traceback.format_exc()
+                    } | extra_fields
+                )
+                if critical:  # Terminates execution
+                    raise
+                return
+
+            duration = (time.perf_counter() - start)  # Seconds
+
+            get_logger().info(
+                f"{exc_type} operation completed.", extra={
+                    "item_id": item_id,
+                    "duration_sec": round(duration, 4),
+                    "outer_location": func_name,
+                    "outer_filename": file_name,
+                } | extra_fields
+            )
+            return result
+        return timer_wrapper
+    return decorator
+
+def analysis():
+    None

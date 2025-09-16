@@ -7,7 +7,14 @@ Created on Thu Apr 24 13:20:24 2025
 """
 
 import pandas as pd
+from warnings import simplefilter
+
+# Ignores misleading Pandas performance warnings
+simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
+
+from technically.const import DATE_BUCKETS, MIN_PERIODS
 import numpy as np
+import re
 from sklearn.preprocessing import (
     StandardScaler,
     MinMaxScaler,
@@ -17,8 +24,58 @@ from sklearn.preprocessing import (
     PowerTransformer
 )
 
+# Ignores sklearn All-NaN RuntimeWarning
+simplefilter(action='ignore', category=RuntimeWarning)
 
-def npshift(arr, periods=1):
+def reformat_names(item: str) -> str:
+    """
+    Re-formats future PostgreSQL column/table names to prevent them from being treated as constants.
+
+    Args:
+        item: The string to re-format.
+
+    Examples:
+        reformat_names('helloFromBoston') returns 'hello_from_boston'
+        reformat_names('6043567') returns '_6043567'
+
+    Returns:
+        str: The re-formatted string.
+    """
+    if isinstance(item, str):
+        # Removes all spaces and special characters from item
+        item = re.sub(r'[^A-Za-z0-9_]', '', item)
+
+        # Handles known exceptions to default rules
+        if item == "permaTicker":
+            item = "permaticker"
+        elif item.startswith("US"):
+            item = "us" + item[2:]
+        elif item == "trailingPEG1Y":
+            item = "trailing_peg_1y"
+        elif item == "prefDVDS":
+            item = "pref_dvds"
+
+        # Converts camel case to snake case
+        item = re.sub(r'(?<!^)(?=[A-Z])', '_', item)
+
+        # Adds underscore to items beginning with a digit
+        item = re.sub(r'^(\d)', r'_\1', item)
+
+        return item.lower()
+    else:
+        return item
+
+def np_shift(arr: np.ndarray, periods=1):
+    """
+    Shift numpy array (like pandas.shift).
+
+    Args:
+        arr (np.ndarray): The numpy array to be shifted.
+        periods (int, optional): How many periods to shift. Default is 1.
+
+    Returns:
+        result (np.ndarray): The shifted numpy array.
+    """
     result = np.empty_like(arr, dtype=float)
     if periods > 0:
         result[:periods] = np.nan
@@ -30,25 +87,37 @@ def npshift(arr, periods=1):
         return arr.copy()
     return result
 
-def nprolling(arr, period: int, calc_type: str = "mean", func_dict = {"func": None}):
-    if isinstance(arr, np.ndarray):
-        # Keep track of NaN positions
-        null_mask = np.isnan(arr)
+def np_rolling(arr: np.ndarray, period: int, calc_type: str, func_dict=None):
+    """
+    Conducts rolling window operations on numpy array.
 
-        # Get indices of non-NaN values
-        valid_indices = np.where(~null_mask)[0]
+    Args:
+        arr (np.ndarray): The numpy array to roll.
+        period (int): Size of rolling window.
+        calc_type (str): Type of rolling window operation.
+        func_dict (dict, optional): Function dict for custom rolling window operations.
+            Keys are string names of functions to execute.
+            Values are a pointer to the function. Default is None.
 
-        # Extract valid values
-        valid_values = arr[valid_indices]
+    Returns:
+        result (np.ndarray): The rolled numpy array.
+    """
+    # Keep track of NaN positions
+    null_mask = np.isnan(arr)
 
-        # If we don't have enough non-NaN values to form even one window, return array of NaNs
-        if len(valid_values) < period:
-            return np.full_like(arr, np.nan)
+    # Get indices of non-NaN values
+    valid_indices = np.where(~null_mask)[0]
 
-        # Perform calculation on valid values
-        if calc_type != "func":
-            windows = np.lib.stride_tricks.sliding_window_view(valid_values, period)
+    # Extract valid values
+    valid_values = arr[valid_indices]
 
+    # If we don't have enough non-NaN values to form even one window, return array of NaNs
+    if len(valid_values) < period:
+        return np.full_like(arr, np.nan)
+
+    # Perform calculation on valid values
+    if calc_type != "func":
+        windows = np.lib.stride_tricks.sliding_window_view(valid_values, period)
         if calc_type == "mean":
             result_values = np.mean(windows, axis=1)
         elif calc_type == "sum":
@@ -59,56 +128,67 @@ def nprolling(arr, period: int, calc_type: str = "mean", func_dict = {"func": No
             result_values = np.min(windows, axis=1)
         elif calc_type == "max":
             result_values = np.max(windows, axis=1)
-        elif calc_type == "func":
-            func = func_dict.get("func")
-            func_params = {k: v for k, v in func_dict.items() if k != "func"}
-
-            output_len = arr.shape[0] - period + 1
-            result_values = np.full(arr.shape[0], False, dtype=bool)
-            for i in range(output_len):
-                window = arr[i:i+period]
-                result_values[i+period-1] = func(window, **func_params)
-            return result_values
         else:
             raise ValueError("Invalid type. Must be 'mean', 'std', 'min', 'max', or 'func'.")
-    else:
-        raise TypeError("Input must be a NumPy array.")
+        # Create result array with same shape as input, filled with NaNs
+        result = np.full_like(arr, np.nan)
 
-    # Create result array with same shape as input, filled with NaNs
-    result = np.full_like(arr, np.nan)
+        # Account for window size
+        result_positions = valid_indices[period - 1:]
 
-    # Place results at correct positions, accounting for window size
-    # The result indices need to be offset by (period-1) to align correctly
-    result_positions = valid_indices[period - 1:]
+        # Place results
+        result[result_positions] = result_values
+        return result
+    # Run a custom function on array
+    elif calc_type == "func":
+        func = func_dict.get("func")
+        func_params = {k: v for k, v in func_dict.items() if k != "func"}
 
-    # Place results
-    result[result_positions] = result_values
+        output_len = arr.shape[0] - period + 1
+        result = np.full(arr.shape[0], False, dtype=bool)
+        for i in range(output_len):
+            window = arr[i:i + period]
+            result[i + period - 1] = func(window, **func_params)
+        return result
 
-    return result
+def weighted_mean(subdf: pd.DataFrame, weight_col_name: str, group_by: str):
+    """
 
-def weighted_mean(subdf: pd.Series or np.ndarray, weight_col_name: str, group_by_name: str):
-    excluded_cols = [weight_col_name, group_by_name, "assetType"]
+    Args:
+        subdf (pd.Series or np.ndarray): The pandas dataframe to get weighted mean for.
+        weight_col_name (str): The column to weigh the mean by.
+        group_by (str): The column to group the data by.
+
+    Returns:
+
+    """
+    excluded_cols = [weight_col_name, group_by, "asset_type"]
     for col in subdf.columns:
         if col in excluded_cols:
             continue
-        subdf[subdf[group_by_name] == "Unknown"][col] = np.average(subdf[col], weights=subdf[weight_col_name])
+        subdf[subdf[group_by] == "unknown"][col] = np.average(subdf[col], weights=subdf[weight_col_name])
     return subdf
 
-def bucketizer(subdf: pd.DataFrame, buckets: list = ["1997-01-01", "2003-01-01", "2009-01-01", "2017-01-01", "2020-01-01"]):
+def bucketizer(subdf: pd.DataFrame):
     """
-    :param subdf: Must include date column and columns to split into buckets
-    :param buckets: Defaults at a reasonable set of eras
-    :return: The bucketed dataframes
+    Separates one dataframe into several dataframes divided by date thresholds.
+
+    Args:
+        subdf (pd.DataFrame):
+        buckets (list, optional): The date thresholds to divide each dataframe by.
+
+    Returns:
+        bucketed_dfs (list): List of bucketed dataframes.
     """
     bucketer = subdf["date"]
     bucketed_dfs = []
-    for i in range(len(buckets) + 1):
+    for i in range(len(DATE_BUCKETS) + 1):
         if i == 0:
-            condition = bucketer < buckets[i]
-        elif i != 0 and i != len(buckets):
-            condition = (bucketer < buckets[i]) & (bucketer >= buckets[i - 1])
+            condition = bucketer < DATE_BUCKETS[i]
+        elif i != 0 and i != len(DATE_BUCKETS):
+            condition = (bucketer < DATE_BUCKETS[i]) & (bucketer >= DATE_BUCKETS[i - 1])
         else:
-            condition = bucketer >= buckets[-1]
+            condition = bucketer >= DATE_BUCKETS[-1]
         bucket = subdf[condition]
         # For newer tickers to be properly bucketed
         if bucket.empty:
@@ -116,52 +196,97 @@ def bucketizer(subdf: pd.DataFrame, buckets: list = ["1997-01-01", "2003-01-01",
         bucketed_dfs.append(bucket)
     return bucketed_dfs
 
-def scaler(scaler: str, subdf: pd.DataFrame or np.ndarray, bucketed=False, return_as="numpy"):
+def scaler(scaler_type: str, subdf: pd.DataFrame | np.ndarray, bucketed=False, return_as="numpy"):
     """
-    scaler: Pass the scaler to use: options are Standard, MinMax, MaxAbs, Robust, QuantileTransformer, PowerTransformer
-    subdf: Pass a dataframe containing columns to standardize
-    bucketed: Set to True to scale each self.bucket dataframe independently; set to False to scale full dataframe
+    Scales numpy array or pandas dataframe.
+
+    Args:
+        scaler_type (str): Type of scaler to use. Options are Standard, MinMax, MaxAbs, Robust, QuantileTransformer, PowerTransformer.
+        subdf: Dataframe containing columns to scale.
+        bucketed (bool, optional): True scales each bucketed dataframe independently, False scales full dataframe. Defaults to False.
+        return_as (str, optional): Datatype to return. Defaults to "numpy".
+
+    Returns:
+        np.ndarray or pd.DataFrame: Scaled numpy array or pandas dataframe.
     """
     if type(subdf) == pd.Series:
         subdf = pd.DataFrame(subdf)
 
-    if scaler == "Standard":
-        scaler = StandardScaler()
-    elif scaler == "MinMax":
-        scaler = MinMaxScaler()
-    elif scaler == "MaxAbs":
-        scaler = MaxAbsScaler()
-    elif scaler == "Robust":
-        scaler = RobustScaler()
-    elif scaler == "QuantileTransformer":
-        scaler = QuantileTransformer()
-    elif scaler == "PowerTransformer":
-        scaler = PowerTransformer()
+    if scaler_type == "Standard":
+        scaler_obj = StandardScaler()
+    elif scaler_type == "MinMax":
+        scaler_obj = MinMaxScaler()
+    elif scaler_type == "MaxAbs":
+        scaler_obj = MaxAbsScaler()
+    elif scaler_type == "Robust":
+        scaler_obj = RobustScaler()
+    elif scaler_type == "QuantileTransformer":
+        scaler_obj = QuantileTransformer()
+    else:
+        scaler_obj = PowerTransformer()
 
     if bucketed:
         buckets = bucketizer(subdf)
         scaled_buckets = []
         for bucket in buckets:
-            scaler.fit(bucket)
-            scaled_buckets.append(scaler.transform(bucket))
+            scaler_obj.fit(bucket)
+            scaled_buckets.append(scaler_obj.transform(bucket))
         scaled_df = np.concatenate(scaled_buckets)
     else:
-        scaler.fit(subdf)
-        scaled_df = scaler.transform(subdf)
+        scaler_obj.fit(subdf)
+        scaled_df = scaler_obj.transform(subdf)
     if return_as == "numpy":
         return scaled_df
-    elif return_as == "pandas":
+    else:
         return pd.DataFrame(scaled_df, columns=subdf.columns)
 
-def rolling_zscore(data: pd.Series or np.ndarray, window=250, min_len=120):
+def rolling_zscore(data: pd.Series | np.ndarray, window=250):
+    """
+    Compute rolling zscore using rolling window operations.
+
+    Args:
+        data (pd.Series or np.ndarray): The pandas series or numpy array to operate on.
+        window: Size of rolling window.
+
+    Returns:
+        np.ndarray: The rolling zscore result as numpy array.
+    """
     if len(data) <= window:
-        window = min_len
+        window = MIN_PERIODS
 
-    if type(data) == np.ndarray:
-        data = pd.Series(data)
-    return (data - data.rolling(window).mean()) / data.rolling(window).std()
+    if isinstance(data, pd.Series):
+        data = data.values
 
-def percentile(data: pd.Series or np.ndarray, percent: int or str):
+    mean = np.full_like(data, np.nan)
+    mean[window - 1:] = np.convolve(data, np.ones(window) / window, mode='valid')
+    sq = data ** 2
+    mean_sq = np.full_like(data, np.nan)
+    mean_sq[window - 1:] = np.convolve(sq, np.ones(window) / window, mode='valid')
+    var = (mean_sq - mean ** 2) * (window / (window - 1))
+    std = np.sqrt(var)
+    return (data - mean) / std
+    #if len(data) <= window:
+    #    window = MIN_PERIODS
+    #
+    #if type(data) == np.ndarray:
+    #    data = pd.Series(data)
+    #return (data - data.rolling(window).mean()) / data.rolling(window).std()
+
+def percentile(data: pd.Series | np.ndarray, percent: int | str):
+    """
+    Compute percentile.
+
+    Args:
+        data (pd.Series or np.ndarray): The pandas series or numpy array to operate on.
+        percent (int or str): Percentile to compute.
+
+    Examples:
+        percentile(arr, 10)- 10th percentile
+        percentile(ser, "25th")- 25th percentile
+
+    Returns:
+       np.ndarray: The percentile result as numpy array.
+    """
     # If percent is formatted as "1st" or "50th"
     if isinstance(percent, str):
         percent = int(percent[:-2])
@@ -169,19 +294,34 @@ def percentile(data: pd.Series or np.ndarray, percent: int or str):
     if type(data) == pd.Series:
         data = data.dropna()
         A = data.values
-    if type(data) == np.ndarray:
+    elif type(data) == np.ndarray:
         A = data[~np.isnan(data)]
+    else:
+        raise TypeError(
+            "Input must be a NumPy array or Pandas Series."
+        )
 
     return np.percentile(A, percent)
 
-def lineBestFit(Y: pd.Series or np.ndarray, period: int, return_as="list"):
-    if isinstance(Y, pd.Series):
-        Y = Y.values
-    X = np.asarray(range(len(Y)))
+def line_best_fit(data: pd.Series | np.ndarray, period: int, return_as="list"):
+    """
+    Finds the line of best fit for rolling windows of data.
+
+    Args:
+        data (pd.Series or np.ndarray): The pandas series or numpy array to operate on.
+        period: Length of rolling window.
+        return_as (str, optional): Datatype to return. Options are "numpy" or "list". Defaults to "list".
+
+    Returns:
+        covariance_result: List or np.ndarray of results.
+    """
+    if isinstance(data, pd.Series):
+        data = data.values
+    X = np.asarray(range(len(data)))
 
     # Precompute sliding window sums
     X_slices = np.lib.stride_tricks.sliding_window_view(X, period)
-    Y_slices = np.lib.stride_tricks.sliding_window_view(Y, period)
+    Y_slices = np.lib.stride_tricks.sliding_window_view(data, period)
 
     n_windows = X_slices.shape[0]
     sum_x = np.sum(X_slices, axis=1)
@@ -206,47 +346,51 @@ def lineBestFit(Y: pd.Series or np.ndarray, period: int, return_as="list"):
     else:
         return covariance_result
 
-def failureSwings(Y_window, type: str, threshold: int or float):
+def failure_swings(y_window: pd.Series, swing_type: str, threshold: int | float):
     """
-    :param Y_window: A window of values (from Y.rolling(window)): pd.Series
-    :param type: either 'bottom' or 'top'
-    :param threshold: indicator threshold (I.e. -100 for bullish CCI)
-    :param min_thresh: Minimum number of periods between swing points
-    :return:
+    Detects the occurrence of a failure swings using a threshold-based technical indicator signal.
+
+    Args:
+        y_window (pd.Series): A single window of values derived from a larger dataframe.
+        swing_type (str): The direction to search for swings. Options are "bottom" or "top".
+        threshold (int or float): indicator threshold (I.e. -100 for bullish CCI)
+
+    Returns:
+        bullish_swing or bearish_swing (bool): Whether a failure swing occurs or not for the window.
     """
-    Y = Y_window.tolist()
-    if type == "bottom":
-        low = min(Y)
+    y = y_window.tolist()
+    if swing_type == "bottom":
+        low = min(y)
         if low > threshold:
             return False
-        min_thresh = Y.index(low) + 3
-        if min_thresh > len(Y)+1:
+        min_thresh = y.index(low) + 3
+        if min_thresh > len(y) + 1:
             return False
-        Y_eval = Y[min_thresh:]
+        y_eval = y[min_thresh:]
         try:
             lowest_valley = min(
-                [v for i, v in zip(range(len(Y_eval)-1), Y_eval[:-1])
-                 if Y_eval[i] < Y_eval[i+1] and Y_eval[i] < Y_eval[i-1]]
+                [v for i, v in zip(range(len(y_eval) - 1), y_eval[:-1])
+                 if y_eval[i] < y_eval[i + 1] and y_eval[i] < y_eval[i - 1]]
             )
         except ValueError:
             return False
-        bullish_swing = (Y[-2] == lowest_valley)
+        bullish_swing = (y[-2] == lowest_valley)
         return bullish_swing
 
-    if type == "top":
-        high = max(Y)
+    if swing_type == "top":
+        high = max(y)
         if high < threshold:
             return False
-        max_thresh = Y.index(high) + 3
-        if max_thresh > len(Y)+1:
+        max_thresh = y.index(high) + 3
+        if max_thresh > len(y)+1:
             return False
-        Y_eval = Y[max_thresh:]
+        y_eval = y[max_thresh:]
         try:
             highest_peak = max(
-                [v for i, v in zip(range(len(Y_eval)-1), Y_eval[:-1])
-                 if Y_eval[i] > Y_eval[i+1] and Y_eval[i] > Y_eval[i-1]]
+                [v for i, v in zip(range(len(y_eval) - 1), y_eval[:-1])
+                 if y_eval[i] > y_eval[i + 1] and y_eval[i] > y_eval[i - 1]]
             )
         except ValueError:
             return False
-        bearish_swing = (Y[-2] == highest_peak)
+        bearish_swing = (y[-2] == highest_peak)
         return bearish_swing

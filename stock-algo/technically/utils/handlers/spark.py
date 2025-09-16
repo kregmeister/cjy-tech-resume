@@ -7,31 +7,31 @@ Created on Thu Feb  6 12:15:43 2025
 """
 
 from pyspark.sql import SparkSession
-
 import os
 import sys
 import traceback
 
-from technically.utils.exceptions import PySparkCloseError
 from technically.utils.log import get_logger
 
 
 class PySparkSession:
-    "Manages spark session creation and data extraction."
-    
+    """
+    Manages spark session creation and data extraction.
+    """
+
     def __init__(self):
         # Tells pyspark to point to TC venv for imports
         venv = sys.executable
         os.environ["PYSPARK_PYTHON"] = venv
         os.environ["PYSPARK_DRIVER_PYTHON"] = venv
-    
+
     def __enter__(self):
         self.session = SparkSession.builder \
             .appName("sparkClusterTC") \
             .config("spark.driver.memory", "16g") \
             .config("spark.driver.maxResultSize", "8g") \
             .getOrCreate()
-            
+
         return self
 
     def __exit__(self, exc_type, exc_value, exc_traceback):

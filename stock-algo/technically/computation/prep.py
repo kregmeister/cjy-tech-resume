@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Fri Jun 12 13:03:47 2025
-
-@author: cjymain
-"""
-
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -15,33 +7,32 @@ Created on Fri Jan 10 14:31:58 2025
 """
 
 import pandas as pd
-import importlib_resources as rs
+import numpy as np
 
-import technically.utils.optimizations as opts
+from technically.const import ML_FEATURE_ENGINEERING_CONFIG, TREND_PERIODS
+import technically.utils.optimizations as utils
+
 
 class ModelPreparation:
     """
     Prepares individual ticker data for core models.
     """
 
-    def __init__(self, df: pd.DataFrame, mode: str):
+    def __init__(self, ticker, df: pd.DataFrame, mode: str):
+        self.ticker = ticker
         self.df = df
         self.mode = mode
 
     def get_config(self):
-        feature_engineering_config = pd.read_json(
-            rs.open_text("technically", "conf/ml_config.json")
-        )[self.mode]
+        self.scaling_type = ML_FEATURE_ENGINEERING_CONFIG[self.mode]["cols_to_scale"]["type"]
+        self.scaling_cols = ML_FEATURE_ENGINEERING_CONFIG[self.mode]["cols_to_scale"]["features"]
 
-        self.scaling_type = feature_engineering_config["cols_to_scale"]["type"]
-        self.scaling_cols = feature_engineering_config["cols_to_scale"]["features"]
-
-        self.rolling_periods = feature_engineering_config["cols_to_roll"]["windows"]
-        self.rolling_cols = feature_engineering_config["cols_to_roll"]["features"]
+        self.rolling_periods = ML_FEATURE_ENGINEERING_CONFIG[self.mode]["cols_to_roll"]["windows"]
+        self.rolling_cols = ML_FEATURE_ENGINEERING_CONFIG[self.mode]["cols_to_roll"]["features"]
 
         if self.mode == "technicals":  # See 'ml_config.json'
-            self.lagging_periods = feature_engineering_config["cols_to_lag"]["lag_periods"]
-            self.lagging_cols = feature_engineering_config["cols_to_lag"]["features"]
+            self.lagging_periods = ML_FEATURE_ENGINEERING_CONFIG[self.mode]["cols_to_lag"]["lag_periods"]
+            self.lagging_cols = ML_FEATURE_ENGINEERING_CONFIG[self.mode]["cols_to_lag"]["features"]
 
     def execute(self):
         self.get_config()
@@ -50,7 +41,6 @@ class ModelPreparation:
         self.roll(self.rolling_cols, self.rolling_periods)
         if self.mode == "technicals":
             self.lag(self.lagging_cols, self.lagging_periods)
-
 
         return self.df
 
@@ -61,16 +51,18 @@ class ModelPreparation:
         :param features_to_scale: List of features to scale
         :param scaling_type: Can equal Standard, MinMax, MaxAbs, Robust, QuantileTransformer, PowerTransformer
         """
-        subdf = self.df[features_to_scale].copy()
+        # Not all tickers will have all columns listed in ml_config.json
+        features = [f for f in features_to_scale if f in self.df.columns]
 
         # Scales
-        scaled_df = opts.scaler(
+        scaled_df = utils.scaler(
             scaling_type,
-            subdf,
+            self.df[features].copy(),
             return_as="pandas"
         )
+
         # Applies changes
-        self.df[features_to_scale] = scaled_df
+        self.df[features] = scaled_df
         return
 
     def roll(self, features_to_roll, windows):
@@ -80,37 +72,19 @@ class ModelPreparation:
         :param features_to_roll: List of feature names to create rolling stats for
         :param windows: List of window sizes for rolling calculations
         """
+        # Not all tickers will have all columns listed in ml_config.json
+        features = [f for f in features_to_roll if f in self.df.columns]
 
-        subdf = self.df[features_to_roll].copy()
-
-        for feature in features_to_roll:
+        for feature in features:
             for window_size in windows:
-                arr = subdf[feature].values
+                arr = self.df[feature].copy().values
 
-                self.df[f"{feature}_mean_{window_size}"] = opts.nprolling(
-                    arr,
-                    window_size,
-                    calc_type="mean"
-                )
-
-                self.df[f"{feature}_std_{window_size}"] = opts.nprolling(
-                    arr,
-                    window_size,
-                    calc_type="std"
-                )
-
-                self.df[f"{feature}_min_{window_size}"] = opts.nprolling(
-                    arr,
-                    window_size,
-                    calc_type="min"
-                )
-
-                self.df[f"{feature}_max_{window_size}"] = opts.nprolling(
-                    arr,
-                    window_size,
-                    calc_type="max"
-                )
-
+                for roll_type in ["mean", "std", "min", "max"]:
+                    self.df[f"{feature}_{roll_type}_{window_size}"] = utils.np_rolling(
+                        arr,
+                        window_size,
+                        calc_type=roll_type
+                    )
         return
 
     def lag(self, features_to_lag, lag_periods):
@@ -123,10 +97,10 @@ class ModelPreparation:
 
         :return: Spark DataFrame with lagged features
         """
+        # Not all tickers will have all columns listed in ml_config.json
+        features = [f for f in features_to_lag if f in self.df.columns]
 
-        subdf = self.df[features_to_lag].copy()
-
-        for feature in features_to_lag:
+        for feature in features:
             for lag_period in lag_periods:
-                self.df[f"{feature}_lagged_{lag_period}"] = subdf[feature].shift(lag_period)
+                self.df[f"{feature}_lagged_{lag_period}"] = self.df[feature].copy().shift(lag_period)
         return

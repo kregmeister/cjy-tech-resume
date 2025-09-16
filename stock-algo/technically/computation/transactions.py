@@ -5,22 +5,14 @@ Created on Fri Nov  8 10:17:22 2024
 
 @author: cjymain
 """
-
+import pandas as pd
+from technically.const import GROUP_BY
 from technically.core.cleaning import (
-    adjustForSplits,
-    marketCapCategory
+    adjust_for_splits,
+    market_cap_category
 )
-from technically.utils.exceptions import NoDataReturnedError
-from technically.utils.handlers.db import DuckDB
+from technically.utils.handlers.db import PostgreSQL
 from technically.utils.log import get_logger
-
-from duckdb import (
-    InvalidInputException,
-    ConstraintException,
-    BinderException,
-    CatalogException,
-    ConversionException
-)
 import numpy as np
 import traceback
 
@@ -28,12 +20,6 @@ class DataAcquisitionController:
     """
     Controls metadata retrieval, Tiingo data acquisition, and writing data to DuckDB.
     """
-
-    def __init__(self, base_path):
-        self.base_path = base_path
-        self.price_db = base_path + "/sql/prices.duck"
-        self.fund_db = base_path + "/sql/fundamentals.duck"
-        self.model_db = base_path + "/sql/models.duck"
 
     def metadata(self):
         """
@@ -43,283 +29,324 @@ class DataAcquisitionController:
             [prices_metadata, fundamentals_metadata]: Two tuples containing metadata for prices and fundamentals, respectively.
         """
 
-        with DuckDB(self.price_db) as db:
-            prices_metadata = db.sql('''
+        with PostgreSQL() as conn:
+            prices_metadata_query = '''
                 SELECT
-                    CASE 
-                        WHEN duplicated = False THEN ticker 
-                        ELSE permaTicker 
-                    END AS ticker,
+                    table_alias as ticker,
                     exchange,
-                    capCategory,
+                    cap_category,
                     sector,
-                    assetType,
-                    lastPricesCheck,
-                    dailyLastUpdated,
-                    pricesInitialized
+                    asset_type,
+                    newest_db_prices,
+                    last_processed,
+                    prices_initialized
                 FROM 
-                    metadata
+                    prices.metadata
                 WHERE 
                     designation = 'active'
                     OR 
-                        designation != 'deadTicker' 
-                        AND pricesInitialized = false;
+                        designation = 'delisted' 
+                        OR designation = 'recent_dates_inactive'
+                        AND prices_initialized = false
+                        OR last_processed = '1990-01-01';
                 '''
-            ).fetchall()
+            prices_metadata = conn.run_query(
+                prices_metadata_query,
+                return_as="tuple"
+            )
 
-            fundamentals_metadata = db.sql('''
+            fundamentals_metadata_query = '''
                 SELECT
-                    CASE 
-                        WHEN duplicated = False THEN ticker 
-                        ELSE permaTicker 
-                    END AS ticker,
+                    table_alias as ticker,
                     exchange,
-                    capCategory,
+                    cap_category,
                     sector,
-                    lastFundamentalsCheck,
-                    statementLastUpdated,
-                    fundamentalsInitialized
+                    newest_db_statements,
+                    last_statement_api_update,
+                    next_expected_statements_release,
+                    last_processed,
+                    fundamentals_initialized
                 FROM 
-                    metadata
+                    prices.metadata
                 WHERE 
                     designation = 'active'
-                    AND assetType = 'stock'
-                    AND statementLastUpdated IS NOT NULL
+                    AND asset_type = 'stock'
+                    AND no_api_statements = false
                     OR 
                         designation != 'active'
-                        AND statementLastUpdated IS NOT NULL
-                        AND fundamentalsInitialized = false;
+                        AND last_statement_api_update IS NOT NULL
+                        AND fundamentals_initialized = false;
                 '''
-            ).fetchall()
+            fundamentals_metadata = conn.run_query(
+                fundamentals_metadata_query,
+                return_as="tuple"
+            )
 
         return [prices_metadata, fundamentals_metadata]
 
-    def models(self, group_by="sector"):
+    def models(self):
         """
         Retrieves technical indicator success rates or creates the database table if it doesn't exist.
 
-        Args:
-            group_by (str): Which column to group success rates by. Default is sector.
-
         Returns:
-            indicator_success_rates: DataFrame of indicator success rates.
+            backtest_success_rates: DataFrame of indicator success rates.
         """
 
-        with DuckDB(self.model_db) as db:
-            if not db.has_table("indicatorSuccessRates"):
-                get_logger().info("No indicator success rate table found. Creating empty table")
-                db.execute('''
-                    CREATE TABLE indicatorSuccessRates (
+        with PostgreSQL() as conn:
+            if not conn.has_table("backtest_success_rates", "models"):
+                get_logger().info(
+                    "No indicator success rate table found. Creating empty table."
+                )
+                create_table_query = '''
+                    CREATE TABLE models.backtest_success_rates (
                         date DATE, 
                         ticker VARCHAR, 
                         sector VARCHAR,
                         cap VARCHAR,
                         exchange VARCHAR,
                         indicator VARCHAR,
-                        signalName VARCHAR,
-                        reversalCount INTEGER,
-                        reversalSuccess INTEGER,
-                        reversalFailure INTEGER,
-                        continuationCount INTEGER,
-                        continuationSuccess INTEGER,
-                        continuationFailure INTEGER,
-                        PRIMARY KEY (ticker, signalName)
+                        signal_name VARCHAR,
+                        reversal_count INTEGER,
+                        reversal_success INTEGER,
+                        reversal_failure INTEGER,
+                        continuation_count INTEGER,
+                        continuation_success INTEGER,
+                        continuation_failure INTEGER,
+                        PRIMARY KEY (ticker, signal_name)
                     );
                     '''
+                conn.run_query(
+                    create_table_query,
+                    commit=True
                 )
-
-            indicator_success_rates = db.sql(f'''
+            extract_success_rates_query = '''
                 SELECT 
                     sector, 
-                    signalName, 
-                    AVG(reversalSuccess / reversalCount) AS reversalSuccessRate, 
-                    AVG(continuationSuccess / continuationCount) AS continuationSuccessRate 
+                    signal_name, 
+                    AVG(CAST(reversal_success AS double precision) / NULLIF(reversal_count, 0)) AS reversal_success_rate, 
+                    AVG(CAST(continuation_success AS double precision)  / NULLIF(continuation_count, 0)) AS continuation_success_rate 
                 FROM 
-                    indicatorSuccessRates 
-                GROUP BY 
-                    {group_by}, 
-                    signalName;
+                    models.backtest_success_rates 
+                GROUP BY
+                    {group}, 
+                    signal_name;
                 '''
-            ).df()
-
-        if indicator_success_rates.empty:
-            get_logger().warning(
-                "No indicator success rates found. Indicator scores will be defaults until backtesting is conducted."
+            backtest_success_rates = conn.run_query(
+                extract_success_rates_query,
+                params={"group": GROUP_BY},
+                return_as="pandas"
             )
-            return indicator_success_rates
 
-        bearish_mask = indicator_success_rates["signalName"].str.startswith("bearish")
+            if backtest_success_rates.empty:
+                get_logger().warning(
+                    "No indicator success rates found. Indicator scores will be defaults until backtesting is conducted."
+                )
+                return backtest_success_rates
 
-        indicator_success_rates.loc[bearish_mask, ["reversalSuccessRate", "continuationSuccessRate"]] = \
-            indicator_success_rates[["reversalSuccessRate", "continuationSuccessRate"]].apply(lambda x: x * -1)
+            bearish_mask = backtest_success_rates["signal_name"].str.startswith("bearish")
 
-        # Fills in nulls and infinite values with 0.0
-        indicator_success_rates.fillna(0.0, inplace=True)
-        indicator_success_rates.replace([np.inf, -np.inf], 0.0, inplace=True)
+            backtest_success_rates.loc[bearish_mask, ["reversal_success_rate", "continuation_success_rate"]] = \
+                backtest_success_rates[["reversal_success_rate", "continuation_success_rate"]].apply(lambda x: x * -1)
 
-        return indicator_success_rates
+            # Fills in nulls and infinite values with 0.0
+            backtest_success_rates.fillna(0.0, inplace=True)
+            backtest_success_rates.replace([np.inf, -np.inf], 0.0, inplace=True)
 
-    def prices(self, api_session, ticker: str, today: str, exchange: str, capCategory: str, sector: str, assetType: str, latestData: str, initialized: bool):
+            return backtest_success_rates
+
+    def prices(self, api_session, ticker: str, exchange: str, cap_category: str, sector: str, asset_type: str, newest_db_prices: str, initialized: bool):
         """
         Handles the ingestion of price data, formats it, and writes it to DuckDB.
 
         Args:
             api_session: The active HTTPS session used for making API calls.
             ticker (str): Ticker symbol.
-            today (str): Today's date in YYYY-MM-DD string format.
             exchange: Ticker exchange.
-            capCategory (str): Ticker market cap category.
+            cap_category (str): Ticker market cap category.
             sector (str): Ticker sector.
-            assetType (str): Ticker asset type. Can equal "stock" or "etf".
-            latestData (str): Latest data stored in database for ticker, formatted as YYYY-MM-DD.
-            initialized (bool): Indicates if the database table should be initialized.
+            asset_type (str): Ticker asset type. Can equal "stock" or "etf".
+            newest_db_prices (str): Latest data stored in database for ticker, formatted as YYYY-MM-DD.
+            initialized (bool): True if database table exists, False if it needs to be created.
 
         Returns:
             Union[None, True]:
                 - None: Any variety of errors/inconsistencies occurred.
                 - True: Indicates the data transmission was successful.
         """
+        with PostgreSQL() as conn:
+            # Obtain the data from Tiingo
+            try:
+                df = api_session.daily_prices(
+                    ticker, asset_type, newest_db_prices
+                )
+            except Exception:
+                get_logger().error(
+                    "Unexpected error retrieving price data.", extra={
+                        "item_id": ticker,
+                        "error": traceback.format_exc()
+                    }
+                )
+                return
 
-        # Obtain the data from Tiingo
-        try:
-            daily_df = api_session.daily_prices(
-                ticker, assetType, latestData
-            )
-        except Exception as e:
-            get_logger().error(f"Unexpected error retreiving price data for {ticker}: {traceback.format_exc()}")
-            return
+            if not isinstance(df, pd.DataFrame):
+                if df == "ticker_not_found":
+                    change_alias_to_peramticker = '''
+                        UPDATE prices.metadata SET use_permaticker = True
+                            WHERE ticker = :ticker
+                        '''
+                    conn.run_query(
+                        change_alias_to_peramticker,
+                        params={"ticker": ticker},
+                        commit=True
+                    )
+                    get_logger().warning(
+                        "Ticker not found. Will retry with permaticker next execution.", extra={
+                            "item_id": ticker,
+                            "api": "tiingo"
+                        }
+                    )
+                else:
+                    get_logger().warning(
+                        "Price API call returned no data.", extra={
+                            "item_id": ticker,
+                            "api": "tiingo"
+                        }
+                    )
+                return
 
-        if daily_df is None:
-            get_logger().error(NoDataReturnedError("prices", ticker))
-            return
+            # Determines cap (if data available)
+            if "market_cap" in df.columns:
+                current_cap = df["market_cap"].iloc[-1]
+                cap_category = market_cap_category(current_cap)
 
-        # Determines cap (if data available)
-        if "marketCap" in daily_df.columns:
-            current_cap = daily_df["marketCap"].iloc[-1]
-            capCategory = marketCapCategory(current_cap)
+            # Casts volume column as integer
+            df["volume"] = df["volume"].astype(int)
 
-        # Casts volume column as integer
-        daily_df["volume"] = daily_df["volume"].astype(int)
-
-        with DuckDB(self.price_db) as db:
             if not initialized:  # Table doesn't exist
                 # Fully adjust the newly acquired price data (if a split is present)
-                if any(daily_df["splitFactor"] != 1.0):
-                    daily_df = adjustForSplits(daily_df.copy())
+                if any(df["split_factor"] != 1.0):
+                    df = adjust_for_splits(df.copy())
 
                 try:
-                    db.execute(f'''
-                        CREATE TABLE "{ticker}" AS 
-                            SELECT * FROM daily_df;
-                        '''
+                    with conn.DataFrameToPostgreSQL(conn, ticker, "prices", df) as databridge:
+                        databridge.create_table_from_df(primary_key=["date"])
+                except Exception:
+                    get_logger().error(
+                        ("Error creating prices table. It may already exist. "
+                         "Table will be deleted to allow for proper initialization."),
+                        extra={
+                            "item_id": ticker,
+                            "error": traceback.format_exc()
+                        }
                     )
-                except CatalogException:
-                    get_logger().warning(f"Prices table for {ticker} already exists. "
-                                         "Table will be deleted to allow for proper initialization.")
-                    db.sql(f'''
-                        DROP TABLE IF EXISTS "{ticker}";
+                    drop_query = '''
+                        DROP TABLE IF EXISTS prices.{table};
                         '''
+                    conn.run_query(
+                        drop_query,
+                        params={"table": ticker},
+                        commit=True
                     )
                     return
-
-                db.execute(f'''
-                    ALTER TABLE "{ticker}"
-                        ADD PRIMARY KEY (date);
-                    '''
-                )
             else:  # Table exists
-                df_cols = ", ".join(daily_df.columns)
+                for i, sf in enumerate(df["split_factor"]):
+                    # Adjusts existing ticker's table for a new split (if it's present)
+                    if sf != 1.0:
+                        update_query = '''
+                            UPDATE 
+                                prices.{table}
+                            SET 
+                                open = (open / {sf}),
+                                high = (high / {sf}),
+                                low = (low / {sf}),
+                                close = (close / {sf}),
+                                volume = (volume * {sf});
+                            '''
+                        conn.run_query(
+                            update_query,
+                            params={"table": ticker, "sf": sf},
+                            commit=True
+                        )
+                with conn.DataFrameToPostgreSQL(conn, ticker, "prices", df) as databridge:
+                    status = databridge.insert_or_replace_df_into_table("date")
 
-                try:
-                    for i, sf in enumerate(daily_df["splitFactor"]):
-                        # Adjusts existing ticker's table for a new split (if it's present)
-                        if sf != 1.0:
-                            db.execute(f'''
-                                UPDATE 
-                                    "{ticker}"
-                                SET 
-                                    open = (open / {sf}),
-                                    high = (high / {sf}),
-                                    low = (low / {sf}),
-                                    close = (close / {sf}),
-                                    volume = (volume * {sf});
-                                '''
-                            )
+                    # Indicates that ticker does not have a prices table; metadata is reset
+                    if status == "no_table":
+                        get_logger().error(
+                            ("Ticker is marked as initialized but does not have a price table. ",
+                             "Resetting its metadata."),
+                            extra={
+                                "item_id": ticker,
+                                "error": traceback.format_exc()
+                            }
+                        )
+                        # Allows ticker to properly re-initialize next execution
+                        metadata_reset_query = '''
+                           UPDATE
+                               prices.metadata
+                           SET newest_db_prices = DEFAULT,
+                               prices_initialized = DEFAULT
+                           WHERE 
+                               table_alias = :ticker;
+                           '''
+                        conn.run_query(
+                            metadata_reset_query,
+                            params={"ticker": ticker},
+                            commit=True
+                        )
+                        return
+                    elif status == "binder_error":
+                        get_logger().warning(
+                            ("Price data table likely does not yet have daily fundamentals columns. ",
+                             "Attempting to add them now."),
+                            extra={
+                                "item_id": ticker,
+                                "error": traceback.format_exc()
+                            }
+                        )
+                        conn.add_missing_columns(
+                            ticker,
+                            list(df.columns)
+                        )
+                        return
+                    elif status != True:  # Uncaught error
+                        get_logger().error(
+                            "Unknown error appending to price table.", extra={
+                                "item_id": ticker,
+                                "error": status,
+                            }
+                        )
+                        return
 
-                    db.execute(f'''
-                        INSERT INTO "{ticker}" ({df_cols})
-                            SELECT 
-                                *
-                            FROM 
-                                daily_df
-                            WHERE 
-                                daily_df.date NOT IN (
-                                    SELECT 
-                                        date 
-                                    FROM 
-                                        "{ticker}"
-                                );
-                        '''
-                    )
-                except ConversionException as e:
-                    # Isolates the problematic value from the error message
-                    problematic_value = float(str(e).split("value")[1].split("can")[0].strip())
-
-                    # Finds out which column the problematic value is in
-                    occurences = daily_df.isin([problematic_value]).any()
-                    problematic_col = occurences[occurences == True].index[0]
-
-                    get_logger().error(f"Conversion error for {ticker}. Value {problematic_value} in column {problematic_col} cannot be converted to INT32.")
-                    return
-                except BinderException:
-                    get_logger().info(f"Table for {ticker} likely does not yet have daily fundamentals columns. Adding them now.")
-                    db.add_missing_columns_to_table(
-                        ticker,
-                        list(daily_df.columns)
-                    )
-                    return
-                except CatalogException:
-                    get_logger().warning(f"{ticker} is marked as initialized but does not have a prices table. Addressing.")
-                    # Updates metadata so that ticker will be treated as un-initialized next time
-                    db.execute('''
-                        UPDATE 
-                            metadata
-                        SET
-                            lastPricesCheck = DEFAULT,
-                            pricesInitialized = false
-                        WHERE
-                            CASE 
-                                WHEN duplicated = False THEN ticker 
-                                ELSE permaTicker END = ?;
-                        ''', [ticker]
-                    )
-                    return
-
-            latest_date = daily_df["date"].iloc[-1]
-
-            db.execute(f'''
+            update_query = '''
                 UPDATE 
-                    metadata 
+                    prices.metadata 
                 SET
-                    capCategory = ?,
-                    lastPricesCheck = ?,
-                    pricesInitialized = true,
+                    cap_category = :cap,
+                    newest_db_prices = :date,
+                    prices_initialized = :init
                 WHERE 
-                    CASE 
-                        WHEN duplicated = False THEN ticker 
-                        ELSE permaTicker END = ?;
-                ''', [capCategory, latest_date, ticker]
+                    table_alias = :ticker;
+                '''
+            conn.run_query(
+                update_query,
+                params={
+                    "ticker": ticker,
+                    "cap": cap_category,
+                    "date": df["date"].iloc[-1],
+                    "init": initialized,
+                },
+                commit=True
             )
         return True
 
-    def fundamentals(self, api_session, ticker: str, today: str, start_date: str, initialized: bool):
+    def fundamentals(self, api_session, ticker: str, start_date: str, initialized: bool):
         """
         Handles the ingestion of fundamental statements data, formats it, and writes it to DuckDB.
 
         Args:
             api_session: The active HTTPS session used for making API calls.
             ticker (str): Ticker symbol.
-            today (str): Today's date in YYYY-MM-DD string format.
             start_date (str): The earliest date to search for statements for ticker, formatted as YYYY-MM-DD.
             initialized (bool): Indicates if the database table should be initialized.
 
@@ -329,127 +356,153 @@ class DataAcquisitionController:
                 - True: Indicates the data transmission was successful.
         """
         try:
-            quarterly_dfs = api_session.fundamentals_statements(
+            statement_dfs_dict = api_session.fundamentals_statements(
                 ticker, start_date
             )
-        except Exception as e:
-            get_logger().error(f"Unexpected error retreiving statement data for {ticker}: {traceback.format_exc()}")
-            return
-
-        # If no data returned, sets check to constant so it's not re-checked daily (resets every Friday)
-        if quarterly_dfs is None:
-            with DuckDB(self.price_db) as db:
-                db.execute('''
-                    UPDATE 
-                        metadata
-                    SET 
-                        lastFundamentalsCheck = '3000-01-01'
-                    WHERE 
-                        CASE 
-                            WHEN duplicated = False THEN ticker 
-                            ELSE permaTicker END = ?;
-                    ''', [ticker]
-                )
-            get_logger().warning(NoDataReturnedError("fundamentals", ticker))
-            return
-
-        # Writes each statement df to its own table
-        for stmt_type, df in quarterly_dfs.items():
-            if df is None:
-                continue
-
-            df = df.sort_values("date")
-            df_cols = ", ".join(df.columns)
-            table_name = f"{ticker}_{stmt_type}"
-
-            with DuckDB(self.fund_db) as db:
-                if not initialized:  # If not in system
-                    try:
-                        db.execute(f'''
-                            CREATE OR REPLACE TABLE "{table_name}" AS
-                                SELECT * FROM df;
-                            '''
-                        )
-                    except CatalogException:
-                        get_logger().warning(f"Fundamentals table for {ticker} already exists. ",
-                                             "Tables will be deleted to allow for proper initialization.")
-                        db.execute('''
-                            UPDATE 
-                                metadata
-                            SET
-                                lastFundamentalsCheck = DEFAULT
-                            WHERE
-                                CASE 
-                                    WHEN duplicated = False THEN ticker 
-                                    ELSE permaTicker END = ?;
-                            ''', [ticker]
-                        )
-                        db.execute(f'''
-                            DROP TABLE IF EXISTS "{table_name}";
-                            '''
-                        )
-                        continue
-
-                    db.execute(f'''
-                        ALTER TABLE "{table_name}"
-                            ADD PRIMARY KEY (date);
-                        '''
-                    )
-                else:  # In system
-                    try:
-                        db.execute(f'''
-                            INSERT INTO "{table_name}" ({df_cols})
-                                SELECT 
-                                    *
-                                FROM 
-                                    df
-                                WHERE df.date NOT IN (
-                                    SELECT 
-                                        date
-                                    FROM 
-                                        "{table_name}"
-                                );
-                            '''
-                        )
-                    # Triggered when a ticker does not have data for stmt_type
-                    except (InvalidInputException, ConstraintException, CatalogException) as e:
-                        if str(e) == f"Table with name {table_name} does not exist!":
-                            get_logger().warning(f"{table_name} for {ticker} does not exist. Setting fundamentalsInitialized to false.")
-                            # Resets fundamentals metadata so that statements, likely newly available to Tiingo, can be fully gathered
-                            db.execute('''
-                                UPDATE 
-                                    metadata
-                                SET 
-                                    lastFundamentalsCheck = '2010-01-01',
-                                    fundamentalsInitialized = false
-                                WHERE 
-                                    CASE 
-                                        WHEN duplicated = False THEN ticker 
-                                        ELSE permaTicker END = ?;
-                                ''', [ticker]
-                            )
-                        else:
-                            get_logger().warning(f"Unexpected error appending to table {table_name}: {traceback.format_exc()}")
-                        continue
-                    except BinderException:  # Mismatched col
-                        get_logger().info(f"Statement df columns do not match columns in {table_name}. "
-                                          "Adding them.")
-                        db.add_missing_columns_to_table(
-                            table_name,
-                            list(df.columns)
-                        )
-                        continue
-
-            db.execute('''
-                UPDATE 
-                    metadata
-                SET 
-                    lastFundamentalsCheck = ?,
-                    fundamentalsInitialized = true
-                WHERE 
-                    CASE 
-                        WHEN duplicated = False THEN ticker 
-                        ELSE permaTicker END = ?;
-                ''', [today, ticker]
+        except Exception:
+            get_logger().error(
+                "Unexpected error retrieving fundamental statement data.", extra={
+                    "item_id": ticker,
+                    "error": traceback.format_exc(),
+                }
             )
+            return
+
+        # Ensures that when the API does not have statements for a ticker, it is not re-checked every execution
+        with PostgreSQL() as conn:
+            if not isinstance(statement_dfs_dict, dict):
+                update_query = '''
+                    UPDATE 
+                        prices.metadata
+                    SET 
+                        no_api_statements = true
+                    WHERE 
+                        table_alias = :ticker
+                        AND fundamentals_initialized = false;
+                    '''
+                conn.run_query(
+                    update_query,
+                    params={"ticker": ticker},
+                    commit=True
+                )
+                get_logger().info(
+                    "Fundamental statements API call returned no data.", extra={
+                        "item_id": ticker,
+                        "api": "tiingo"
+                    }
+                )
+                return
+
+            # Writes each statement df to its own table
+            for stmt_type, df in statement_dfs_dict.items():
+                if not isinstance(df, pd.DataFrame):
+                    continue
+
+                df = df.sort_values("date")
+                table_name = f"{ticker}_{stmt_type}"
+
+                if not initialized:  # If not in system
+                    with conn.DataFrameToPostgreSQL(conn, table_name, "fundamentals", df) as databridge:
+                        success = databridge.create_table_from_df(
+                            primary_key=["date"]
+                        )
+                        if not success:
+                            get_logger().warning(
+                                ("Fundamentals table already exists. ",
+                                 "Tables will be deleted to allow for proper initialization."), extra={
+                                    "item_id": ticker,
+                                    "error": traceback.format_exc()
+                                }
+                            )
+                            # Resets fundamentals metadata
+                            update_query = '''
+                                UPDATE 
+                                    prices.metadata
+                                SET
+                                    newest_db_statements = DEFAULT,
+                                    fundamentals_initialized = DEFAULT
+                                WHERE
+                                    table_alias = :ticker;
+                                '''
+                            conn.run_query(
+                                update_query,
+                                params={"ticker": ticker},
+                                commit=True
+                            )
+
+                            drop_query = '''
+                                DROP TABLE IF EXISTS fundamentals.{table_name};
+                                '''
+                            conn.run_query(
+                                drop_query,
+                                params={"table_name": table_name},
+                                commit=True
+                            )
+                            continue
+                else:  # In system
+                    with conn.DataFrameToPostgreSQL(conn, table_name, "fundamentals", df) as databridge:
+                        status = databridge.insert_or_replace_df_into_table("date")
+
+                        # Triggered when a ticker does not have data for stmt_type
+                        if status == "no_table":
+                            get_logger().error(
+                                ("Ticker is marked as initialized but does not have a statement table. ",
+                                 "Resetting its metadata."),
+                                extra={
+                                    "item_id": f"{ticker}.{stmt_type}",
+                                    "error": traceback.format_exc()
+                                }
+                            )
+                            # Allows ticker to properly re-initialize next execution
+                            update_query = '''
+                                UPDATE 
+                                    prices.metadata
+                                SET 
+                                    newest_db_statements = DEFAULT,
+                                    fundamentals_initialized = DEFAULT
+                                WHERE 
+                                    table_alias = :ticker;
+                                '''
+                            conn.run_query(
+                                update_query,
+                                params={"ticker": ticker},
+                                commit=True
+                            )
+                        elif status == "binder_error":
+                            get_logger().warning(
+                                "New fundamental statement data columns are mismatched to existing DB table. "
+                                "Adding them.", extra={
+                                    "item_id": ticker,
+                                    "fundamental_statement": table_name
+                                }
+                            )
+                            conn.add_missing_columns(
+                                table_name,
+                                list(df.columns)
+                            )
+                            continue
+                        elif status != True:  # Uncaught error
+                            get_logger().error(
+                                "Unknown error appending to statement table.", extra={
+                                    "item_id": ticker,
+                                    "fundamental_statement": table_name,
+                                    "error": status
+                                }
+                            )
+                            continue
+
+                update_query = '''
+                    UPDATE 
+                        prices.metadata
+                    SET 
+                        newest_db_statements = :date,
+                        fundamentals_initialized = true
+                    WHERE 
+                        table_alias = :ticker;
+                    '''
+                conn.run_query(
+                    update_query,
+                    params={"date": df["date"].iloc[-1], "ticker": ticker},
+                    commit=True
+                )
         return True

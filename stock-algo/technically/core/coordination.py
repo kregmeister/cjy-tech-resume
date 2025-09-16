@@ -13,9 +13,9 @@ from technically.computation.transactions import DataAcquisitionController
 from technically.computation.calculations import TechnicalsExecutor, FundamentalsExecutor
 from technically.computation.breadth import BreadthExecutor
 
-from technically.utils.handlers.auth import get_credentials
-from technically.utils.log import log_method
-from technically.utils.handlers.queue import CalculationsOrchestrator
+from technically.const import CURRENT_DATE
+from technically.utils.log import timer
+from technically.utils.handlers.calc_queue import CalculationsOrchestrator
 
 
 class DataAcquisitionCoordinator:
@@ -23,24 +23,29 @@ class DataAcquisitionCoordinator:
     Coordinates data acquisition and analysis for each ticker.
     """
 
-    def __init__(self, base_path, today, regen=False):
-        self.base_path = base_path
-        self.today = today
+    def __init__(self, regen=False):
         # When true, new data is not acquired and parquets are regenerated
         self.regen = regen
         # Pass api session and database connections to child classes
-        self.handler = DataAcquisitionController(
-            self.base_path,
-        )
+        self.handler = DataAcquisitionController()
 
         # Retrieves ticker metadata from databases
         self.prices_metadata, self.fundamentals_metadata = self.handler.metadata()
 
         # Retrieves backtesting metrics to apply in technical analysis
-        self.indicator_success_rates = self.handler.models()
+        self.backtest_success_rates = self.handler.models()
 
-        # Retrieves API credentials once
-        self.tiingo_credentials = get_credentials(["tiingo_api_key"])
+        # Initializes queue for technical calculations
+        self.price_queue = CalculationsOrchestrator(
+            TechnicalsExecutor,
+            self.backtest_success_rates
+        )
+
+        # Queue for fundamentals calculations
+        self.fund_queue = CalculationsOrchestrator(
+            FundamentalsExecutor,
+            None
+        )
 
     def execute(self):
         # Retrieves ticker price data from Tiingo
@@ -52,9 +57,9 @@ class DataAcquisitionCoordinator:
         self.fund_queue.stop_workers_signal()
 
         # Calculates breadth metrics for all tickers
-        BreadthExecutor(self.base_path).execute()
+        BreadthExecutor().execute()
 
-    @log_method(critical=True)
+    @timer(critical=True)
     def get_prices(self):
         """
         Parent-level coordinator for ticker-by-ticker price data acquisition,
@@ -63,43 +68,35 @@ class DataAcquisitionCoordinator:
         Returns:
             None
         """
-        # Initializes queue for technical calculations
-        self.price_queue = CalculationsOrchestrator(
-            TechnicalsExecutor,
-            self.base_path,
-            self.base_path + "/sql/prices.duck",
-            self.indicator_success_rates
-        )
-
-        with TiingoAPI(self.base_path, self.tiingo_credentials) as api:
+        with TiingoAPI() as api:
             # Loops through every ticker's metadata
-            for ticker, exchange, capCategory, sector, assetType, lastDailyCheck, dailyLastUpdated, isInitialized in self.prices_metadata:
+            for ticker, exchange, cap_category, sector, asset_type, newest_db_prices, last_processed, initialized in self.prices_metadata:
                 # Prevents retrieval of existing dates from Tiingo
-                if isInitialized:
-                    lastDailyCheck = lastDailyCheck + timedelta(days=1)
+                if initialized:
+                    newest_db_prices = newest_db_prices + timedelta(days=1)
 
                 if not self.regen:  # Skips data acquisition
                     # Acquires data, cleans it, and writes it to database
                     resp = self.handler.prices(
                         api,
                         ticker,
-                        self.today,
                         exchange,
-                        capCategory,
+                        cap_category,
                         sector,
-                        assetType,
-                        lastDailyCheck,
-                        isInitialized
+                        asset_type,
+                        newest_db_prices,
+                        initialized
                     )
-                    if resp is None:  # No new data/error
+                    # Ensures all tickers get processed at least once
+                    if resp is None and last_processed != '1990-01-01':
                         continue  # No technical analysis
 
                 # Formats required inputs for technical calculations queue
-                q_lst = [ticker, exchange, capCategory, sector]
+                q_lst = [ticker, exchange, cap_category, sector, last_processed, initialized]
                 self.price_queue.add_ticker(q_lst)  # Places in queue
         return
 
-    @log_method(critical=True)
+    @timer(critical=True)
     def get_statements(self):
         """
         Parent-level coordinator for ticker-by-ticker statements data acquisition,
@@ -108,21 +105,16 @@ class DataAcquisitionCoordinator:
         Returns:
             None
         """
-        # Queue for near-real time fundamentals calculations
-        self.fund_queue = CalculationsOrchestrator(
-            FundamentalsExecutor,
-            self.base_path,
-            self.base_path + "/sql/fundamentals.duck",
-            None
-        )
-        with TiingoAPI(self.base_path, self.tiingo_credentials) as api:
+        with TiingoAPI() as api:
             # Loops through every ticker's metadata
-            for ticker, exchange, capCategory, sector, lastStatementCheck, statementLastUpdated, isInitialized in self.fundamentals_metadata:
-                # Sets fundamentals statement data cutoff to within API boundaries
-                if lastStatementCheck == date(1990, 1, 1):
-                    lastStatementCheck = date(2014, 1, 1)
-                elif lastStatementCheck < statementLastUpdated:
-                    lastStatementCheck = lastStatementCheck - timedelta(days=3)
+            for ticker, exchange, cap_category, sector, newest_db_statements, last_statement_api_update, next_expected_statements_release, last_processed, initialized in self.fundamentals_metadata:
+                # Ensures that new statements are only checked for when:
+                # 1. It's expected (>3 months after last statements release)
+                # 2. API endpoint has been updated since last statements acquisition
+                if (next_expected_statements_release <= CURRENT_DATE
+                        and last_statement_api_update > newest_db_statements
+                        or last_processed == '1990-01-01'):
+                    newest_db_statements = newest_db_statements + timedelta(days=1)
                 else:
                     continue
 
@@ -131,14 +123,14 @@ class DataAcquisitionCoordinator:
                     resp = self.handler.fundamentals(
                         api,
                         ticker,
-                        self.today,
-                        lastStatementCheck,
-                        isInitialized
+                        newest_db_statements,
+                        initialized
                     )
-                    if resp is None:  # No new data/error
+                    # Ensures all tickers get processed at least once
+                    if resp is None and last_processed != '1990-01-01':
                         continue  # No fundamental analysis
 
                 # Formats required inputs for fundamental calculations queue
-                q_lst = [ticker, exchange, capCategory, sector]
+                q_lst = [ticker, exchange, cap_category, sector, newest_db_statements, initialized]
                 self.fund_queue.add_ticker(q_lst)  # Places in queue
         return

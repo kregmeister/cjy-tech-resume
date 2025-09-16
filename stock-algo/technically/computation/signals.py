@@ -7,11 +7,11 @@ Created on Fri Feb  14 10:58:21 2025
 """
 import numpy as np
 import pandas as pd
-from scipy.special import expit
-import importlib_resources as rs
 import traceback
 
+from technically.const import INDICATOR_SIGNALS_CONFIG, MIN_PERIODS
 from technically.utils import optimizations as utils
+from technically.utils.handlers.db import PostgreSQL
 from technically.utils.log import get_logger
 
 
@@ -20,21 +20,70 @@ class TechnicalIndicatorSignals:
     Identifies technical indicator signals.
     """
 
-    def __init__(self, ticker: str, df: pd.DataFrame, indicator_success_rates, base_path: str):
+    def __init__(self, ticker: str, df: pd.DataFrame, backtest_success_rates, calc_num: int):
         self.ticker = ticker
         self.df = df
-        self.indicator_success_rates = indicator_success_rates
-        self.signal_parameters = pd.read_json(
-            rs.open_text("technically", "conf/indicatorSignals.json")
-        )
-        self.counter = 0
+        self.backtest_success_rates = backtest_success_rates  # Already grouped
+        self.calc_num = calc_num + MIN_PERIODS
+        self.full = True if self.calc_num > len(self.df) else False
+        if self.check() or self.calc_num > len(self.df):
+            self.full = True
+        else:
+            self.full = False
+
+    def check(self):
+        """
+        Checks whether most recent backtesting success rates have been applied to scores recursively.
+
+        Returns:
+            resp (bool): True for recursive, False for incremental.
+        """
+        with PostgreSQL() as db:
+            query = '''
+                SELECT 
+                    recent_backtest 
+                FROM 
+                    prices.metadata
+                WHERE 
+                    table_alias = :ticker;
+            '''
+            resp = db.run_query(
+                query, params={
+                    "ticker": self.ticker
+                }
+            ).fetchall()[0][0]
+        return resp
+
+    def reset_recent_backtest(self):
+        """
+        Sets recent_backtest to False once new backtest rates have been applied to scores recursively.
+
+        Returns:
+            None
+        """
+        with PostgreSQL() as db:
+            query = '''
+                UPDATE 
+                    prices.metadata 
+                SET 
+                    recent_backtest = DEFAULT 
+                WHERE 
+                    table_alias = :ticker;
+                '''
+            db.run_query(
+                query, params={
+                    "ticker": self.ticker,
+                },
+                commit=True
+            )
+        return
 
     def calculate(self, indicator: str, identify=True):
         """
         Orchestrates steps to identify, categorize, and score technical indicator signal occurrences.
 
         Args:
-            indicator (str): Name of indicator to find signals for.
+            indicator (str): Name of indicator to find signals for (as listed in indicator_signals.json)
             identify (bool): Whether the signals should be identified or not. Default is True.
 
         Returns:
@@ -51,9 +100,14 @@ class TechnicalIndicatorSignals:
             categorized_results = self.assign_reversal_continuation(results)
             # Applies historic signal success rates as a percent to be applied to the signal 'score'
             self.apply_success_rates(categorized_results)
+        # PARTIAL SIGNAL IDENTIFICATION WILL ONLY REMAIN IF ML MODELS CAN PROPERLY HANDLE/ACCOUNT FOR NULLS
         except Exception:
-            get_logger().error(f"Error calculating signals for {indicator} on {self.ticker}: {traceback.format_exc()}")
-        self.counter += 1
+            get_logger().error(
+                f"Error calculating signals for {indicator}.", extra={
+                    "item_id": self.ticker,
+                    "error": traceback.format_exc()
+                }
+            )
         return
 
     def persist(self):
@@ -64,36 +118,35 @@ class TechnicalIndicatorSignals:
         Handles the conditional logic of an indicator signal and finds periods where true.
 
         Args:
-            indicator (str): The indicator to find signals for, must be equal to its column counterpart in self.df.
+            indicator (str): The indicator to find signals for (as listed in indicator_signals.json)
 
         Returns:
             all_conditions (dict): Keys are signal name.
                 Values are boolean pd.Series that indicate whether a signal occurs during that period.
         """
-        # Skips indicators that do not have an entry in 'indicatorSignals.json' or that are all null in the df
-        if (indicator not in self.signal_parameters["indicator"].values or
+        # Skips indicators that do not have an entry in 'indicator_signals.json' or that are all null in the df
+        if (indicator not in INDICATOR_SIGNALS_CONFIG["indicator"] or
                 self.df[indicator].isnull().all()):
             return
 
-        self.indicator = indicator
-        # Isolates signals for the indicator
-        indicator_parameters = self.signal_parameters[self.signal_parameters["indicator"] == indicator]
         all_conditions = {}
+        for signal_direction in ["bullish_signals", "bearish_signals"]:
+            signal_prefix = signal_direction[:-7]
 
-        for signal_direction in ["bullishSignals", "bearishSignals"]:
-            signal_prefix = signal_direction[:-7]+"_"
-            # Isolates collection of conditions required for a signal to confirm
-            parameters = indicator_parameters[signal_direction].to_dict()[self.counter]
+            # Isolates collection of bullish/bearish signals for the indicator
+            indicator_signals = [
+                i for i in INDICATOR_SIGNALS_CONFIG[signal_direction] if i["indicator"] == indicator
+            ][0]
+
             # Iterates through each condition of the signal's set
-            for signal_type, signal_conditions in list(parameters.items())[1:]:
-                self.signal_type = signal_type
-                signal_key = signal_prefix+signal_conditions["name"]
+            for signal_type, signal_conditions in list(indicator_signals.items())[1:]:
+                signal_key = signal_prefix + signal_conditions["name"]
 
                 # When a signal consists of multiple condition types
                 if signal_type.startswith("multi"):
                     res = []
                     for multi_signal_type, multi_signal_conditions in list(signal_conditions.items())[1:]:
-                        res_part = self._signal_construction(multi_signal_type, multi_signal_conditions)
+                        res_part = self._signal_construction(indicator, multi_signal_type, multi_signal_conditions)
 
                         if multi_signal_type[-1].isdigit():
                             res[-1] = pd.concat([res[-1], res_part], axis=1).any(axis=1)
@@ -102,7 +155,7 @@ class TechnicalIndicatorSignals:
                         res.append(res_part)
                     res = pd.concat(res, axis=1).all(axis=1)
                 else:
-                    res = self._signal_construction(signal_type, signal_conditions)
+                    res = self._signal_construction(indicator, signal_type, signal_conditions)
 
                 all_conditions[signal_key] = res
         return all_conditions
@@ -124,10 +177,13 @@ class TechnicalIndicatorSignals:
         for sig_name, res in signals.items():
             res = res.astype(str)
 
-            if sig_name.startswith("bullish"):
-                res[res == "True"] = np.where(self.df["retracementTrend"] == -1, "rev", "cont")
-            elif sig_name.startswith("bearish"):
-                res[res == "True"] = np.where(self.df["retracementTrend"] == 1, "rev", "cont")
+            try:
+                if sig_name.startswith("bullish"):
+                    res[res == "True"] = np.where(self.df["current_trend"] == -1, "rev", "cont")
+                elif sig_name.startswith("bearish"):
+                    res[res == "True"] = np.where(self.df["current_trend"] == 1, "rev", "cont")
+            except ValueError:
+                continue
 
             signals[sig_name] = res
         return signals
@@ -145,38 +201,57 @@ class TechnicalIndicatorSignals:
         Returns:
             None
         """
+        signals_not_backtested = []
+
         for sig_name, res in signals.items():
             sig_direction = sig_name[:7]
 
             try:
-                matching_rates = self.indicator_success_rates[
-                    self.indicator_success_rates["signalName"] == sig_name
+                matching_rates = self.backtest_success_rates[
+                    self.backtest_success_rates["signal_name"] == sig_name
                 ]
+
                 # Applies backtested success rates
-                res[res == "rev"] = matching_rates["reversalSuccessRate"].iloc[0]
-                res[res == "cont"] = matching_rates["continuationSuccessRate"].iloc[0]
-            except KeyError:  # Signal not backtested
+                rev_score = matching_rates["reversal_success_rate"].values[0]
+                cont_score = matching_rates["continuation_success_rate"].values[0]
+                res[res == "rev"] = rev_score
+                res[res == "cont"] = cont_score
+            except IndexError:  # Signal not backtested
+                signals_not_backtested.append(sig_name)
+
                 # Applies arbitrary default success rates so that models can interpret signal occurrence
                 if sig_direction == "bullish":  # Defaults
-                    res[res == "rev"] = 0.5
-                    res[res == "cont"] = 0.25
+                    res[res == "rev"] = 0.3
+                    res[res == "cont"] = 0.15
                 elif sig_direction == "bearish":
-                    res[res == "rev"] = -0.5
-                    res[res == "cont"] = -0.25
+                    res[res == "rev"] = -0.3
+                    res[res == "cont"] = -0.15
 
             # No signal always equals 0.0
             res[res == "False"] = 0.0
-
             res = res.astype(float)
-            self.df[f"{sig_name}_sig"] = res
+
+            column = f"{sig_name}_ind"
+            if self.full:
+                self.df[column] = res
+            else:
+                self.df[column] = pd.Series([np.nan] * len(self.df), index=self.df.index)
+                self.df.loc[self.calc_num:, column] = res
+
+        if signals_not_backtested:  # 1+ signal rates not found
+            get_logger().info(
+                f"Could not find backtested success rates for {signals_not_backtested}. Defaults were applied.", extra={
+                    "item_id": self.ticker
+                }
+            )
         return
 
-    def _signal_construction(self, signal_type: str, signal_conditions: dict):
+    def _signal_construction(self, indicator: str, signal_type: str, signal_conditions: dict):
         """
         Constructs all signal conditions, checks where all are true, and creates boolean results for each period.
 
         Args:
-            signal_type (str): Can equal 'threshold', 'crossover', 'failureSwing', 'divergence', or 'convergence'
+            signal_type (str): Can equal 'threshold', 'crossover', 'failure_swing', 'divergence', or 'convergence'
             signal_conditions (dict): Dictionary of conditions required for a signal to occur.
                 Keys are condition type, values are condition comparison points.
 
@@ -186,89 +261,102 @@ class TechnicalIndicatorSignals:
         if "feature" in signal_conditions:
             feature = self.df[signal_conditions["feature"]].values.copy()
         else:
-            feature = self.df[self.indicator].values.copy()
+            feature = self.df[indicator].values.copy()
+
+        if "trend" in signal_conditions:
+            feature = self._trend(feature, signal_conditions["trend"])
+        if "zscored" in signal_conditions:
+            feature = utils.rolling_zscore(feature, signal_conditions["zscored"])
 
         conditions = []
         if signal_type.startswith("threshold"):
-            if "trend" in signal_conditions:
-                feature = self._trend(feature, signal_conditions["trend"])
-            if "zscored" in signal_conditions:
-                feature = utils.rolling_zscore(feature, signal_conditions["zscored"])
-            if "above" in signal_conditions:
-                above = self._aboveBelow(feature, signal_conditions["above"])
-                cond = feature >= above
-                conditions.append(cond)
-            if "below" in signal_conditions:
-                below = self._aboveBelow(feature, signal_conditions["below"])
-                cond = feature <= below
-                conditions.append(cond)
-            if "length" in signal_conditions:
-                length, rolling_sum = self._length(conditions[-1], signal_conditions["length"])
-                cond = rolling_sum == length
-                conditions.append(cond)
-            if "currentTrend" in signal_conditions:
-                cond = self._currentTrend(signal_conditions["currentTrend"])
-                conditions.append(cond)
+            for cond_type, cond_value in signal_conditions.items():
+                if cond_type == "above":
+                    above = self._above_below(feature, cond_value)
+                    cond = feature >= above
+                elif cond_type == "below":
+                    below = self._above_below(feature, cond_value)
+                    cond = feature <= below
+                elif cond_type == "length":
+                    length, rolling_sum = self._length(conditions[-1], cond_value)
+                    cond = rolling_sum == length
+                elif cond_type == "current_trend":
+                    cond = self._current_trend(cond_value)
+                else:
+                    continue
+
+                if self.full:
+                    conditions.append(cond)
+                else:
+                    conditions.append(cond[-self.calc_num:])
 
         elif signal_type.startswith("crossover"):
-            feature_shifted = utils.npshift(feature, 1)
-            if "above" in signal_conditions:
-                above, above_shifted = self._aboveBelow(None, signal_conditions["above"], "crossover")
-                cond = (feature >= above) & (feature_shifted <= above_shifted)
-                conditions.append(cond)
-            if "below" in signal_conditions:
-                below, below_shifted = self._aboveBelow(None, signal_conditions["below"], "crossover")
-                cond = (feature <= below) & (feature_shifted >= below_shifted)
-                conditions.append(cond)
-            if "currentTrend" in signal_conditions:
-                cond = self._currentTrend(signal_conditions["currentTrend"])
-                conditions.append(cond)
+            feature_shifted = utils.np_shift(feature, 1)
+            for cond_type, cond_value in signal_conditions.items():
+                if cond_type == "above":
+                    above, above_shifted = self._above_below(None, cond_value, "crossover")
+                    cond = (feature >= above) & (feature_shifted <= above_shifted)
+                elif cond_type == "below":
+                    below, below_shifted = self._above_below(None, cond_value, "crossover")
+                    cond = (feature <= below) & (feature_shifted >= below_shifted)
+                elif cond_type == "current_trend":
+                    cond = self._current_trend(cond_value)
+                else:
+                    continue
 
-        elif signal_type.startswith("failureSwing"):
+                if self.full:
+                    conditions.append(cond)
+                else:
+                    conditions.append(cond[-self.calc_num:])
+
+        elif signal_type.startswith("failure_swing"):
             thresh = signal_conditions["thresh"]
-            if "bottom" in signal_conditions:
-                period = signal_conditions["bottom"]
-                cond = utils.nprolling(
-                    feature,
-                    period,
-                    "func",
-                    {"func": utils.failureSwings,
-                     "type": "bottom",
-                     "threshold": thresh}
-                )
-                conditions.append(cond)
-            if "top" in signal_conditions:
-                period = signal_conditions["top"]
-                cond = utils.nprolling(
-                    feature,
-                    period,
-                    "func",
-                    {"func": utils.failureSwings,
-                     "type": "top",
-                     "threshold": thresh}
-                )
-                conditions.append(cond)
-            if "currentTrend" in signal_conditions:
-                cond = self._currentTrend(signal_conditions["currentTrend"])
-                conditions.append(cond)
+            for cond_type, cond_value in signal_conditions.items():
+                if cond_type == "bottom":
+                    period = cond_value
+                    cond = utils.np_rolling(
+                        feature,
+                        period,
+                        "func",
+                        {"func": utils.failure_swings,
+                         "swing_type": "bottom",
+                         "threshold": thresh}
+                    )
+                elif cond_type == "top":
+                    period = cond_value
+                    cond = utils.np_rolling(
+                        feature,
+                        period,
+                        "func",
+                        {"func": utils.failure_swings,
+                         "swing_type": "top",
+                         "threshold": thresh}
+                    )
+                elif cond_type == "current_trend":
+                    cond = self._current_trend(cond_value)
+                else:
+                    continue
+
+                if self.full:
+                    conditions.append(cond)
+                else:
+                    conditions.append(cond[-self.calc_num:])
 
         elif signal_type.startswith(("divergence", "convergence")):
             # CoFeature must be included in divergence
-            cofeature = self.df[signal_conditions["coFeature"]].values.copy()
+            cofeature = self.df[signal_conditions["cofeature"]].values.copy()
 
             # To assure similar scale, divergence features are always zscored
             feature = utils.rolling_zscore(feature, 250)
             cofeature = utils.rolling_zscore(cofeature, 250)
-
             if "trend" in signal_conditions:
                 feature = self._trend(feature, signal_conditions["trend"])
                 cofeature = self._trend(cofeature, signal_conditions["trend"])
-
             if "direction" in signal_conditions:
                 dir_mask, diff = self._direction(feature, cofeature, signal_conditions["direction"])
                 if not np.any(dir_mask):  # Ticker has never had specified trend direction
                     # Condition can never occur if the required direction never occurs; returns all False
-                    return pd.Series(np.full(len(feature), False, dtype=bool), index=self.df.index)
+                    return pd.Series(np.full(len(self.df), False, dtype=bool))
             else:
                 diff = abs(feature - cofeature)
                 dir_mask = np.full(len(feature), True, dtype=bool)
@@ -277,29 +365,40 @@ class TechnicalIndicatorSignals:
             ph = np.full(len(feature), False, dtype=bool)
             valid_indices = np.nonzero(dir_mask)[0]
             diff = diff[valid_indices]
-            if "above" in signal_conditions:
-                above = self._aboveBelow(diff, signal_conditions["above"])
-                cond = diff >= above
-            else:
-                below = self._aboveBelow(diff, signal_conditions["below"])
-                cond = diff <= below
-            ph[valid_indices] = cond
-            conditions.append(ph)
 
-            if "length" in signal_conditions:
-                length, rolling_sum = self._length(conditions[-1], signal_conditions["length"])
-                cond = rolling_sum == length
-                conditions.append(cond)
+            for cond_type, cond_value in signal_conditions.items():
+                if cond_type == "above":
+                    above = self._above_below(diff, cond_value)
+                    cond = diff >= above
+                    ph[valid_indices] = cond
+                    cond = ph
+                elif cond_type == "below":
+                    below = self._above_below(diff, cond_value)
+                    cond = diff <= below
+                    ph[valid_indices] = cond
+                    cond = ph
+                elif cond_type == "length":
+                    length, rolling_sum = self._length(conditions[-1], cond_value)
+                    cond = rolling_sum == length
+                elif cond_type == "current_trend":
+                    cond = self._current_trend(cond_value)
+                else:
+                    continue
 
-            if "currentTrend" in signal_conditions:
-                cond = self._currentTrend(signal_conditions["currentTrend"])
-                conditions.append(cond)
+                if self.full:
+                    conditions.append(cond)
+                else:
+                    conditions.append(cond[-self.calc_num:])
 
         conditions_array = np.column_stack(conditions)
         # Checks where all conditions are true for a period
-        return pd.Series(np.all(conditions_array, axis=1), index=self.df.index)
+        if self.full:
+            idx = self.df.index
+        else:
+            idx = self.df.index[-self.calc_num:]
+        return pd.Series(np.all(conditions_array, axis=1), index=idx)
 
-    def _aboveBelow(self, feature, threshold, type="threshold"):
+    def _above_below(self, feature, threshold, type="threshold"):
         """
         Gathers points of comparison for thresdhold and crossover-based conditions.
 
@@ -316,11 +415,11 @@ class TechnicalIndicatorSignals:
                 - [threshold, threshold]: when type equals "crossover", returns two comparison points.
 
         Examples:
-            >>> return 70  # When self.df["rsi20"] > 70
-            >>> return self.df["bollingerUpper"]  # When self.df["close"] > self.df["bollingerUpper"]
+            return 70  # When self.df["rsi20"] > 70
+            return self.df["bollingerUpper"]  # When self.df["close"] > self.df["bollingerUpper"]
 
-            >>> return [0, 0]  # When self.df["rsi20"] crosses above 0
-            >>> return [self.df["dmiPlus"], self.df["dmiPlus"].shift(1)]  # When self.df["dmiMinus"] crosses above self.df["dmiPlus"]
+            return [0, 0]  # When self.df["rsi20"] crosses above 0
+            return [self.df["dmiPlus"], self.df["dmiPlus"].shift(1)]  # When self.df["dmiMinus"] crosses above self.df["dmiPlus"]
 
         """
         if type == "threshold":
@@ -334,7 +433,7 @@ class TechnicalIndicatorSignals:
         elif type == "crossover":
             if isinstance(threshold, str):
                 t = self.df[threshold].values.copy()
-                t_shifted = utils.npshift(t, 1)
+                t_shifted = utils.np_shift(t, 1)
                 return [t, t_shifted]
             else:
                 return [threshold, threshold]
@@ -351,9 +450,9 @@ class TechnicalIndicatorSignals:
         Returns:
             [length, rolling_sum]
         """
-        return [length, utils.nprolling(condition, length, "sum")]
+        return [length, utils.np_rolling(condition, length, "sum")]
 
-    def _currentTrend(self, target):
+    def _current_trend(self, target):
         """
         When a condition requires a trend to satisfy (uptrend or downtrend).
 
@@ -363,7 +462,7 @@ class TechnicalIndicatorSignals:
         Returns:
             pd.Series: Boolean Series of whether the correct trend is satisfied.
         """
-        return self.df["retracementTrend"] == target
+        return self.df["current_trend"].values == target
 
     def _trend(self, feature, period):
         """
@@ -376,7 +475,7 @@ class TechnicalIndicatorSignals:
         Returns:
             pd.Series: Rate of change in X.
         """
-        return utils.lineBestFit(feature, period, return_as="numpy")
+        return utils.line_best_fit(feature, period, return_as="numpy")
 
     def _direction(self, feature, cofeature, direction):
         """
@@ -404,14 +503,14 @@ class TechnicalIndicatorSignals:
     def total_indicator_score(self):
         """
         Sums all indicator signal scores to summarize price direction indication for the period.
-        Generates self.df columns: totalScore
+        Generates self.df columns: total_score
 
         Returns:
             None
         """
-        signal_columns = [col for col in self.df.columns if col.endswith("_sig")]
+        signal_columns = [col for col in self.df.columns if col.endswith("_ind")]
         total_score = self.df[[col for col in signal_columns]].sum(axis=1)
-        self.df["totalScore"] = total_score.rolling(3).mean()
+        self.df["total_score"] = total_score.rolling(3).mean()
         return
 
     def candlestick_patterns(self):
@@ -472,7 +571,7 @@ class TechnicalIndicatorSignals:
         # Candlestick selection functions
 
         # 5-candle bullish
-        def bullishBreakaway():
+        def bullish_breakaway():
             return (
                     ((shifts["open-4"] - shifts["close-4"]) >= long_red) &
                     ((shifts["open-3"] - shifts["close-3"]) <= short_red) &
@@ -487,7 +586,7 @@ class TechnicalIndicatorSignals:
                     (df["close"] > shifts["open-3"])
             )
 
-        def bullishLadder():
+        def bullish_ladder():
             return (
                     ((shifts["open-4"] - shifts["close-4"]) >= long_red) &
                     ((shifts["open-3"] - shifts["close-3"]) >= long_red) &
@@ -506,7 +605,7 @@ class TechnicalIndicatorSignals:
             )
 
         # 5-candle bearish
-        def bearishBreakaway():
+        def bearish_breakaway():
             return (
                     ((shifts["close-4"] - shifts["open-4"]) >= long_green) &
                     ((shifts["close-3"] - shifts["open-3"]) <= short_green) &
@@ -521,7 +620,7 @@ class TechnicalIndicatorSignals:
                     (df["close"] < shifts["open-3"])
             )
 
-        def bearishLadder():
+        def bearish_ladder():
             return (
                     ((shifts["close-4"] - shifts["open-4"]) >= long_green) &
                     ((shifts["close-3"] - shifts["open-3"]) >= long_green) &
@@ -540,7 +639,7 @@ class TechnicalIndicatorSignals:
             )
 
         # 3-candle bullish
-        def bullishStickSandwich():
+        def bullish_stick_sandwich():
             return (
                     (shifts["close-2"] < shifts["open-2"]) &
                     (shifts["open-1"] > shifts["close-2"]) &
@@ -551,7 +650,7 @@ class TechnicalIndicatorSignals:
                     (abs(df["close"] - shifts["close-2"]) <= price_match)
             )
 
-        def bullishUniqueThreeRivers():
+        def bullish_unique_three_rivers():
             return (
                     ((shifts["open-2"] - shifts["close-2"]) >= long_red) &
                     (shifts["close-1"] > shifts["close-2"]) &
@@ -563,7 +662,7 @@ class TechnicalIndicatorSignals:
                     (df["open"] > shifts["low-1"])
             )
 
-        def bullishMorningStar():
+        def bullish_morning_star():
             return (
                     ((shifts["open-2"] - shifts["close-2"]) >= long_red) &
                     ((abs(shifts["close-1"] - shifts["open-1"])) <= short_green) &
@@ -575,7 +674,7 @@ class TechnicalIndicatorSignals:
                     (df["close"] > shifts["midpoint-2"])
             )
 
-        def bullishTriStar():
+        def bullish_tri_star():
             return (
                     (abs(shifts["close-2"] - shifts["open-2"]) <= doji) &
                     (abs(shifts["close-1"] - shifts["open-1"]) <= doji) &
@@ -584,7 +683,7 @@ class TechnicalIndicatorSignals:
                     (shifts["midpoint-1"] < df["low"])
             )
 
-        def bullishThreeWhiteSoldiers():
+        def bullish_three_white_soldiers():
             return (
                     (shifts["open-2"] < shifts["open-1"]) &
                     (shifts["open-1"] < df["open"]) &
@@ -596,7 +695,7 @@ class TechnicalIndicatorSignals:
             )
 
         # 3-candle bearish
-        def bearishThreeBlackCrows():
+        def bearish_three_black_crows():
             return (
                     (shifts["open-2"] > shifts["open-1"]) &
                     (shifts["open-1"] > df["open"]) &
@@ -607,7 +706,7 @@ class TechnicalIndicatorSignals:
                     ((df["close"] - df["low"]) <= short_lower_tail)
             )
 
-        def bearishEveningStar():
+        def bearish_evening_star():
             return (
                     ((shifts["close-2"] - shifts["open-2"]) >= long_green) &
                     ((abs(shifts["close-1"] - shifts["open-1"])) <= short_green) &
@@ -619,7 +718,7 @@ class TechnicalIndicatorSignals:
                     (df["close"] < shifts["midpoint-2"])
             )
 
-        def bearishTriStar():
+        def bearish_tri_star():
             return (
                     (abs(shifts["close-2"] - shifts["open-2"]) <= doji) &
                     (abs(shifts["close-1"] - shifts["open-1"]) <= doji) &
@@ -629,21 +728,21 @@ class TechnicalIndicatorSignals:
             )
 
         # 2-candle bullish
-        def bullishEngulfing():
+        def bullish_engulfing():
             return (
                     (df["close"] > shifts["open-1"]) &
                     (shifts["open-1"] > shifts["close-1"]) &
                     (shifts["close-1"] > df["open"])
             )
 
-        def bullishMeetingLines():
+        def bullish_meeting_lines():
             return (
                     ((shifts["open-1"] - shifts["close-1"]) >= long_red) &
                     (df["close"] > df["open"]) &
                     (abs(df["close"] - shifts["close-1"]) <= price_match)
             )
 
-        def bullishHarami():
+        def bullish_harami():
             return (
                     ((shifts["open-1"] - shifts["close-1"]) >= long_red) &
                     (shifts["open-1"] > df["close"]) &
@@ -651,7 +750,7 @@ class TechnicalIndicatorSignals:
                     (df["open"] > shifts["close-1"])
             )
 
-        def bullishHaramiCross():
+        def bullish_harami_cross():
             return (
                     ((shifts["open-1"] - shifts["close-1"]) >= long_red) &
                     (abs(df["close"] - df["open"]) <= doji) &
@@ -659,14 +758,14 @@ class TechnicalIndicatorSignals:
                     (shifts["close-1"] < midpoint)
             )
 
-        def bullishPiercingLine():
+        def bullish_piercing_line():
             return (
                     ((shifts["open-1"] - shifts["close-1"]) >= long_red) &
                     (df["open"] < shifts["close-1"]) &
                     (df["close"] > shifts["midpoint-1"])
             )
 
-        def bullishKicking():
+        def bullish_kicking():
             return (
                     (shifts["close-1"] < shifts["open-1"]) &
                     (df["close"] > df["open"]) &
@@ -677,7 +776,7 @@ class TechnicalIndicatorSignals:
                     (shifts["open-1"] < df["open"])
             )
 
-        def bullishHomingPigeon():
+        def bullish_homing_pigeon():
             return (
                     ((shifts["open-1"] - shifts["close-1"]) >= long_red) &
                     ((df["open"] - df["close"]) <= short_red) &
@@ -686,14 +785,14 @@ class TechnicalIndicatorSignals:
                     (shifts["close-1"] < df["close"])
             )
 
-        def bullishMatchingLow():
+        def bullish_matching_low():
             return (
                     (shifts["close-1"] < shifts["open-1"]) &
                     (df["close"] < df["open"]) &
                     (abs(shifts["close-1"] - df["close"]) <= price_match)
             )
 
-        def bullishDojiStar():
+        def bullish_doji_star():
             return (
                     ((shifts["open-1"] - shifts["close-1"]) >= long_red) &
                     (abs(df["close"] - df["open"]) <= doji) &
@@ -701,7 +800,7 @@ class TechnicalIndicatorSignals:
             )
 
         # 2-candle bearish
-        def bearishShootingStar():
+        def bearish_shooting_star():
             return (
                     (midpoint > shifts["close-1"]) &
                     (shifts["close-1"] > shifts["open-1"]) &
@@ -712,7 +811,7 @@ class TechnicalIndicatorSignals:
                      ((df["high"] - df["close"]) >= long_upper_tail))
             )
 
-        def bearishEngulfing():
+        def bearish_engulfing():
             return (
                     (shifts["close-1"] > shifts["open-1"]) &
                     (df["close"] < df["open"]) &
@@ -720,14 +819,14 @@ class TechnicalIndicatorSignals:
                     (shifts["open-1"] > df["close"])
             )
 
-        def bearishMeetingLines():
+        def bearish_meeting_lines():
             return (
                     ((shifts["close-1"] - shifts["open-1"]) >= long_green) &
                     (df["close"] < df["open"]) &
                     (abs(df["close"] - shifts["close-1"]) <= price_match)
             )
 
-        def bearishHarami():
+        def bearish_harami():
             return (
                     ((shifts["close-1"] - shifts["open-1"]) >= long_green) &
                     (shifts["open-1"] < df["close"]) &
@@ -735,7 +834,7 @@ class TechnicalIndicatorSignals:
                     (df["open"] < shifts["close-1"])
             )
 
-        def bearishHaramiCross():
+        def bearish_harami_cross():
             return (
                     ((shifts["close-1"] - shifts["open-1"]) >= long_green) &
                     (abs(df["close"] - df["open"]) <= doji) &
@@ -743,14 +842,14 @@ class TechnicalIndicatorSignals:
                     (shifts["close-1"] > midpoint)
             )
 
-        def bearishDarkCloudCover():
+        def bearish_dark_cloud_cover():
             return (
                     ((shifts["close-1"] - shifts["open-1"]) >= long_green) &
                     (df["open"] > shifts["close-1"]) &
                     (df["close"] < shifts["midpoint-1"])
             )
 
-        def bearishKicking():
+        def bearish_kicking():
             return (
                     (shifts["close-1"] > shifts["open-1"]) &
                     (df["close"] < df["open"]) &
@@ -761,7 +860,7 @@ class TechnicalIndicatorSignals:
                     (shifts["open-1"] > df["open"])
             )
 
-        def bearishMatchingHigh():
+        def bearish_matching_high():
             return (
                     (shifts["close-1"] > shifts["open-1"]) &
                     (df["close"] > df["open"]) &
@@ -769,14 +868,14 @@ class TechnicalIndicatorSignals:
             )
 
         # 1-candle bullish
-        def bullishBeltHold():
+        def bullish_belt_hold():
             return (
                     ((df["close"] - df["open"]) >= long_green) &
                     ((df["high"] - df["close"]) >= short_upper_tail) &
                     ((df["open"] - df["low"]) <= short_lower_tail)
             )
 
-        def bullishInvertedHammer():
+        def bullish_inverted_hammer():
             return (
                     ((abs(df["close"] - df["open"])) <= short_green) &
                     (((df["open"] - df["low"]) <= short_lower_tail) |
@@ -785,7 +884,7 @@ class TechnicalIndicatorSignals:
                      ((df["high"] - df["close"]) >= long_upper_tail))
             )
 
-        def bullishHammer():
+        def bullish_hammer():
             return (
                     (shifts["close-1"] > df["close"]) &
                     ((abs(df["close"] - df["open"])) <= short_green) &
@@ -796,14 +895,14 @@ class TechnicalIndicatorSignals:
             )
 
         # 1-candle bearish
-        def bearishBeltHold():
+        def bearish_belt_hold():
             return (
                     ((df["open"] - df["close"]) >= long_red) &
                     ((df["high"] - df["open"]) <= short_upper_tail) &
                     ((df["close"] - df["low"]) >= short_lower_tail)
             )
 
-        def bearishHangingMan():
+        def bearish_hanging_man():
             return (
                     (shifts["close-1"] < df["close"]) &
                     ((abs(df["close"] - df["open"])) <= short_green) &
@@ -814,15 +913,15 @@ class TechnicalIndicatorSignals:
             )
 
         patterns = [
-            bullishBreakaway, bullishLadder, bearishBreakaway, bearishLadder,
-            bullishStickSandwich, bullishUniqueThreeRivers, bullishMorningStar, bullishTriStar,
-            bullishThreeWhiteSoldiers, bearishThreeBlackCrows, bearishEveningStar, bearishTriStar,
-            bullishEngulfing, bullishMeetingLines, bullishHarami, bullishHaramiCross,
-            bullishPiercingLine, bullishKicking, bullishHomingPigeon, bullishMatchingLow,
-            bullishDojiStar, bearishShootingStar, bearishEngulfing, bearishMeetingLines,
-            bearishHarami, bearishHaramiCross, bearishDarkCloudCover, bearishKicking,
-            bearishMatchingHigh, bullishBeltHold, bullishInvertedHammer, bullishHammer,
-            bearishBeltHold, bearishHangingMan
+            bullish_breakaway, bullish_ladder, bearish_breakaway, bearish_ladder,
+            bullish_stick_sandwich, bullish_unique_three_rivers, bullish_morning_star, bullish_tri_star,
+            bullish_three_white_soldiers, bearish_three_black_crows, bearish_evening_star, bearish_tri_star,
+            bullish_engulfing, bullish_meeting_lines, bullish_harami, bullish_harami_cross,
+            bullish_piercing_line, bullish_kicking, bullish_homing_pigeon, bullish_matching_low,
+            bullish_doji_star, bearish_shooting_star, bearish_engulfing, bearish_meeting_lines,
+            bearish_harami, bearish_harami_cross, bearish_dark_cloud_cover, bearish_kicking,
+            bearish_matching_high, bullish_belt_hold, bullish_inverted_hammer, bullish_hammer,
+            bearish_belt_hold, bearish_hanging_man
         ]
         # Checks for occurrences of all above candlestick patterns
         all_patterns = {func.__name__: func() for func in patterns}

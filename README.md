@@ -1,3 +1,1 @@
-Welcome! My name is Craig Yingling and I have been pursuing data science for about 3 years now. My goal is to contribute to a diverse, skilled team with technical ability, analytical insight, and a strong desire to grow and refine my skillset.
-
-See **cjy_technical_resume_2024.odt** for brief descriptions of my projects and skills development, the **.pdf** files for my official certification completion documents, and the **crisp-dm_writeup.odt** in the traffic_optimizer_project directory for a summary and visualization of the project's goals, accomplishments, results, and areas for improvement.
+Welcome! My name is Craig Yingling. This repository summarizes my efforts over the last 3+ years in building data science skills.
